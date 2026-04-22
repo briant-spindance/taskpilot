@@ -13,19 +13,12 @@ echo ""
 
 # Dry run first
 echo "--- Dry Run ---"
-TASKPILOT_SKILLS_DIR=./test/skills taskpilot run \
-  --prompt-file ./test/prompt.md \
-  --input ./test/input/sales_data.csv \
-  --output ./test/output \
-  --dry-run
+TASKPILOT_SKILLS_DIR=./test/skills taskpilot run sales-report --dry-run
 
 echo ""
 echo "--- Live Run ---"
 
-TASKPILOT_SKILLS_DIR=./test/skills taskpilot run \
-  --prompt-file ./test/prompt.md \
-  --input ./test/input/sales_data.csv \
-  --output ./test/output
+TASKPILOT_SKILLS_DIR=./test/skills taskpilot run sales-report
 
 echo ""
 echo "--- Output ---"

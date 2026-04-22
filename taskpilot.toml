@@ -1,0 +1,5 @@
+[recipes.sales-report]
+prompt_file = "test/prompt.md"
+input = ["test/input/sales_data.csv"]
+output_dir = "test/output"
+skill_deps = ["markdown-report"]

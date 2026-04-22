@@ -1,4 +1,5 @@
 mod install;
+mod recipe;
 mod registry;
 mod runner;
 mod skill;
@@ -19,11 +20,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Execute a skill against a prompt
+    /// Execute a task — either a named recipe from taskpilot.toml or with inline flags
     Run {
-        /// Specific skill to use (optional; model selects from catalog if omitted)
-        #[arg(long)]
-        skill: Option<String>,
+        /// Recipe name from taskpilot.toml (optional — use flags for ad-hoc runs)
+        #[arg(value_name = "RECIPE")]
+        recipe: Option<String>,
 
         /// Task prompt as an inline string
         #[arg(long)]
@@ -39,16 +40,22 @@ enum Commands {
 
         /// Directory where output files are written
         #[arg(long)]
-        output: Option<String>,
+        output_dir: Option<String>,
 
         /// Anthropic model to use
-        #[arg(long, default_value = "claude-sonnet-4-20250514")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
 
         /// Print resolved config without executing
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// List recipes defined in taskpilot.toml
+    Recipes,
+
+    /// Validate taskpilot.toml and check environment
+    Doctor,
 
     /// Manage and inspect discovered skills
     Skills {
@@ -77,9 +84,9 @@ enum SkillsAction {
         /// Search query
         query: Vec<String>,
     },
-    /// Install a skill from the registry (owner/repo@skill)
+    /// Install a skill from the registry (owner/repo/skill)
     Add {
-        /// Skill source (e.g. anthropics/skills@pdf)
+        /// Skill source (e.g. anthropics/skills/pdf)
         source: String,
 
         /// Install globally (~/.agents/skills/) instead of project-level
@@ -96,42 +103,78 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Run {
-            skill: skill_name,
+            recipe: recipe_name,
             prompt,
             prompt_file,
             input,
-            output,
+            output_dir,
             model,
             dry_run,
         } => {
-            // Resolve prompt
-            let task_prompt = if let Some(pf) = prompt_file {
-                fs::read_to_string(&pf).with_context(|| format!("read prompt file: {pf}"))?
-            } else if let Some(p) = prompt {
-                p
-            } else {
-                anyhow::bail!("--prompt or --prompt-file is required");
-            };
+            // If a recipe name is given, load it and merge with CLI flags
+            let (task_prompt, final_input, final_output_dir, final_model) =
+                if let Some(ref name) = recipe_name {
+                    let r = recipe::get(name)?;
+
+                    // Resolve skill dependencies before running
+                    if !r.skill_deps.is_empty() {
+                        eprintln!("{}", "Checking skill dependencies...".dimmed());
+                        recipe::resolve_skill_deps(&r.skill_deps)?;
+                        eprintln!();
+                    }
+
+                    // CLI flags override recipe values
+                    let p = if let Some(ref pf) = prompt_file {
+                        fs::read_to_string(pf)
+                            .with_context(|| format!("read prompt file: {pf}"))?
+                    } else if let Some(ref p) = prompt {
+                        p.clone()
+                    } else if let Some(ref pf) = r.prompt_file {
+                        fs::read_to_string(pf)
+                            .with_context(|| format!("read prompt file: {pf}"))?
+                    } else if let Some(ref p) = r.prompt {
+                        p.clone()
+                    } else {
+                        anyhow::bail!("recipe {name:?} has no prompt or prompt_file");
+                    };
+
+                    let inp = if !input.is_empty() { input } else { r.input.clone() };
+                    let out = output_dir.or(r.output_dir.clone());
+                    let mdl = model.or(r.model.clone());
+
+                    (p, inp, out, mdl)
+                } else {
+                    // No recipe — pure flag-based run
+                    let p = if let Some(pf) = prompt_file {
+                        fs::read_to_string(&pf)
+                            .with_context(|| format!("read prompt file: {pf}"))?
+                    } else if let Some(p) = prompt {
+                        p
+                    } else {
+                        anyhow::bail!("--prompt or --prompt-file is required (or use a recipe name)");
+                    };
+
+                    (p, input, output_dir, model)
+                };
+
+            let resolved_model = final_model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
             // Discover skills
-            let mut skills = skill::discover().context("discover skills")?;
-
-            // Filter to specific skill if requested
-            if let Some(ref name) = skill_name {
-                let s = skill::find_by_name(&skills, name)?.clone();
-                skills = vec![s];
-            }
+            let skills = skill::discover().context("discover skills")?;
 
             if dry_run {
                 println!("=== Dry Run ===");
-                println!("Model: {model}");
+                if let Some(ref name) = recipe_name {
+                    println!("Recipe: {name}");
+                }
+                println!("Model: {resolved_model}");
                 println!("Prompt: {task_prompt}");
                 println!("Skills: {} discovered", skills.len());
                 for s in &skills {
                     println!("  - {} ({})", s.name, s.path.display());
                 }
-                println!("Inputs: {input:?}");
-                println!("Output: {}", output.as_deref().unwrap_or("(none)"));
+                println!("Inputs: {final_input:?}");
+                println!("Output dir: {}", final_output_dir.as_deref().unwrap_or("(none)"));
                 return Ok(());
             }
 
@@ -139,22 +182,30 @@ fn main() -> Result<()> {
             let ws = workspace::Workspace::new()?;
 
             // Stage inputs
-            if !input.is_empty() {
-                ws.stage_inputs(&input)?;
+            if !final_input.is_empty() {
+                ws.stage_inputs(&final_input)?;
             }
 
             // Run agentic loop
             runner::run(&runner::Config {
-                model,
+                model: resolved_model,
                 prompt: task_prompt,
                 skills,
                 work_dir: ws.dir.to_string_lossy().to_string(),
             })?;
 
             // Collect outputs
-            if let Some(ref out) = output {
+            if let Some(ref out) = final_output_dir {
                 ws.collect_outputs(out)?;
             }
+        }
+
+        Commands::Recipes => {
+            recipe::list()?;
+        }
+
+        Commands::Doctor => {
+            recipe::doctor()?;
         }
 
         Commands::Skills { action } => match action {
@@ -206,8 +257,10 @@ fn main() -> Result<()> {
 }
 
 fn truncate_desc(s: &str, max: usize) -> String {
-    // Take first sentence or max chars, whichever is shorter
-    let first_sentence = s.split_once(". ").map(|(f, _)| format!("{f}.")).unwrap_or_else(|| s.to_string());
+    let first_sentence = s
+        .split_once(". ")
+        .map(|(f, _)| format!("{f}."))
+        .unwrap_or_else(|| s.to_string());
     if first_sentence.len() <= max {
         first_sentence
     } else {
