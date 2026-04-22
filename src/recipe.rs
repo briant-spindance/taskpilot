@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -27,6 +27,8 @@ pub struct Recipe {
     pub model: Option<String>,
     #[serde(default)]
     pub skill_deps: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// Load and parse the taskpilot.toml file from the current directory.
@@ -71,8 +73,9 @@ pub fn list() -> Result<()> {
         let summary = if let Some(ref pf) = recipe.prompt_file {
             format!("prompt-file: {pf}")
         } else if let Some(ref p) = recipe.prompt {
-            let truncated = if p.len() > 60 { format!("{}...", &p[..60]) } else { p.clone() };
-            truncated
+            let collapsed = p.replace('\n', " ");
+            let trimmed = collapsed.trim();
+            if trimmed.len() > 60 { format!("{}...", &trimmed[..60]) } else { trimmed.to_string() }
         } else {
             "(no prompt)".to_string()
         };
@@ -95,6 +98,48 @@ pub fn list() -> Result<()> {
         println!("    {}", summary.dimmed());
     }
 
+    Ok(())
+}
+
+/// Initialize a new taskpilot.toml with an example recipe.
+pub fn init() -> Result<()> {
+    let path = Path::new(RECIPE_FILE);
+    if path.exists() {
+        bail!("{RECIPE_FILE} already exists in the current directory");
+    }
+
+    let template = r#"# taskpilot.toml — define named recipes for repeatable agentic tasks
+#
+# Run a recipe:   taskpilot run <name>
+# List recipes:   taskpilot recipes
+# Validate:       taskpilot doctor
+#
+# Recipes can depend on other recipes via depends_on. Dependencies
+# run first in topological order. Circular dependencies are rejected.
+
+[recipes.prepare-data]
+prompt = """
+Read input.csv, clean missing values,
+and write cleaned.csv
+"""
+input = ["data/input.csv"]
+output_dir = "staging/"
+
+[recipes.generate-report]
+prompt = """
+Analyze cleaned.csv and produce a summary report
+in report.md with key metrics and insights
+"""
+input = ["staging/cleaned.csv"]
+output_dir = "output/"
+model = "claude-sonnet-4-20250514"
+# skill_deps = ["markdown-report"]
+depends_on = ["prepare-data"]
+"#;
+
+    fs::write(path, template).context("write taskpilot.toml")?;
+    println!("{} Created {RECIPE_FILE}", "✓".green());
+    println!("  Edit the file to define your recipes, then run: taskpilot doctor");
     Ok(())
 }
 
@@ -153,7 +198,7 @@ pub fn doctor() -> Result<()> {
     }
     println!();
 
-    let skills = skill::discover().unwrap_or_default();
+    let skills = skill::discover(&[]).unwrap_or_default();
 
     for (name, recipe) in &file.recipes {
         println!("  {} {}", "●".cyan(), name.bold());
@@ -215,6 +260,27 @@ pub fn doctor() -> Result<()> {
             }
         }
 
+        // Check depends_on references
+        for dep in &recipe.depends_on {
+            if file.recipes.contains_key(dep.as_str()) {
+                println!("    {} depends_on: {dep}", "✓".green());
+            } else {
+                println!("    {} depends_on: {dep} (recipe not found)", "✗".red());
+                errors += 1;
+            }
+        }
+
+        // Check for circular dependencies
+        if !recipe.depends_on.is_empty() {
+            match resolve_depends_on(name) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("    {} {e}", "✗".red());
+                    errors += 1;
+                }
+            }
+        }
+
         println!();
     }
 
@@ -236,14 +302,65 @@ fn print_summary(errors: u32, warnings: u32) {
     }
 }
 
+/// Resolve the full execution order for a recipe, honoring depends_on.
+/// Returns a topologically sorted list of recipe names ending with the target.
+pub fn resolve_depends_on(target: &str) -> Result<Vec<String>> {
+    let recipes = load()?;
+
+    // Check target exists
+    if !recipes.contains_key(target) {
+        bail!("recipe {target:?} not found in {RECIPE_FILE}");
+    }
+
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    let mut in_stack = HashSet::new();
+
+    fn visit(
+        name: &str,
+        recipes: &HashMap<String, Recipe>,
+        order: &mut Vec<String>,
+        visited: &mut HashSet<String>,
+        in_stack: &mut HashSet<String>,
+    ) -> Result<()> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if in_stack.contains(name) {
+            bail!("circular dependency detected involving recipe {name:?}");
+        }
+        in_stack.insert(name.to_string());
+
+        if let Some(recipe) = recipes.get(name) {
+            for dep in &recipe.depends_on {
+                if !recipes.contains_key(dep.as_str()) {
+                    bail!(
+                        "recipe {name:?} depends on {dep:?}, which does not exist in {RECIPE_FILE}",
+                        RECIPE_FILE = "taskpilot.toml"
+                    );
+                }
+                visit(dep, recipes, order, visited, in_stack)?;
+            }
+        }
+
+        in_stack.remove(name);
+        visited.insert(name.to_string());
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    visit(target, &recipes, &mut order, &mut visited, &mut in_stack)?;
+    Ok(order)
+}
+
 /// Check and resolve skill dependencies for a recipe.
 /// Local deps (bare names) are verified. Remote deps (with /) are auto-installed if missing.
-pub fn resolve_skill_deps(deps: &[String]) -> Result<()> {
+pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> {
     if deps.is_empty() {
         return Ok(());
     }
 
-    let skills = skill::discover().context("discover skills for dep check")?;
+    let skills = skill::discover(extra_dirs).context("discover skills for dep check")?;
 
     for dep in deps {
         let is_remote = dep.contains('/');

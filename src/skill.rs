@@ -22,7 +22,8 @@ struct Frontmatter {
 }
 
 /// Discover all skills from the standard search directories.
-pub fn discover() -> Result<Vec<Skill>> {
+/// Extra directories (e.g. from --skills-dir flags) are appended to the search path.
+pub fn discover(extra_dirs: &[String]) -> Result<Vec<Skill>> {
     let home = dirs_path()?;
     let cwd = env::current_dir().context("resolve working dir")?;
 
@@ -36,6 +37,10 @@ pub fn discover() -> Result<Vec<Skill>> {
         search_dirs.push(PathBuf::from(override_dir));
     } else {
         search_dirs.push(home.join(".taskpilot").join("skills"));
+    }
+
+    for dir in extra_dirs {
+        search_dirs.push(PathBuf::from(dir));
     }
 
     let mut seen = HashMap::new();

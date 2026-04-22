@@ -49,6 +49,14 @@ enum Commands {
         /// Print resolved config without executing
         #[arg(long)]
         dry_run: bool,
+
+        /// Disable streaming output (wait for full response)
+        #[arg(long)]
+        no_stream: bool,
+
+        /// Additional skills directory to search (repeatable)
+        #[arg(long = "skills-dir")]
+        skills_dir: Vec<String>,
     },
 
     /// List recipes defined in taskpilot.toml
@@ -62,6 +70,9 @@ enum Commands {
         #[command(subcommand)]
         action: SkillsAction,
     },
+
+    /// Initialize a new taskpilot.toml with an example recipe
+    Init,
 
     /// Install a skill from a local directory
     Install {
@@ -110,16 +121,35 @@ fn main() -> Result<()> {
             output_dir,
             model,
             dry_run,
+            no_stream,
+            skills_dir,
         } => {
             // If a recipe name is given, load it and merge with CLI flags
             let (task_prompt, final_input, final_output_dir, final_model) =
                 if let Some(ref name) = recipe_name {
+                    // Resolve depends_on chain first
+                    let execution_order = recipe::resolve_depends_on(name)?;
+
+                    // Run all dependencies (everything except the last, which is the target)
+                    if execution_order.len() > 1 {
+                        let deps = &execution_order[..execution_order.len() - 1];
+                        eprintln!(
+                            "{}",
+                            format!("Running {} dependencies first...", deps.len()).dimmed()
+                        );
+                        for dep_name in deps {
+                            eprintln!("\n{} {}", "▶ dependency:".cyan().bold(), dep_name.bold());
+                            run_recipe(dep_name, &[], None, None, None, no_stream, &skills_dir)?;
+                        }
+                        eprintln!("\n{} {}", "▶ target:".green().bold(), name.bold());
+                    }
+
                     let r = recipe::get(name)?;
 
                     // Resolve skill dependencies before running
                     if !r.skill_deps.is_empty() {
                         eprintln!("{}", "Checking skill dependencies...".dimmed());
-                        recipe::resolve_skill_deps(&r.skill_deps)?;
+                        recipe::resolve_skill_deps(&r.skill_deps, &skills_dir)?;
                         eprintln!();
                     }
 
@@ -160,7 +190,7 @@ fn main() -> Result<()> {
             let resolved_model = final_model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
             // Discover skills
-            let skills = skill::discover().context("discover skills")?;
+            let skills = skill::discover(&skills_dir).context("discover skills")?;
 
             if dry_run {
                 println!("=== Dry Run ===");
@@ -192,6 +222,7 @@ fn main() -> Result<()> {
                 prompt: task_prompt,
                 skills,
                 work_dir: ws.dir.to_string_lossy().to_string(),
+                stream: !no_stream,
             })?;
 
             // Collect outputs
@@ -210,7 +241,7 @@ fn main() -> Result<()> {
 
         Commands::Skills { action } => match action {
             SkillsAction::List => {
-                let skills = skill::discover()?;
+                let skills = skill::discover(&[])?;
                 if skills.is_empty() {
                     println!("{}", "No skills found.".dimmed());
                 } else {
@@ -230,7 +261,7 @@ fn main() -> Result<()> {
                 }
             }
             SkillsAction::Show { name } => {
-                let skills = skill::discover()?;
+                let skills = skill::discover(&[])?;
                 let s = skill::find_by_name(&skills, &name)?;
                 println!("Name:        {}", s.name);
                 println!("Description: {}", s.description);
@@ -251,6 +282,71 @@ fn main() -> Result<()> {
         Commands::Install { path } => {
             install::from_local(&path)?;
         }
+
+        Commands::Init => {
+            recipe::init()?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a single recipe by name (used for dependency execution).
+fn run_recipe(
+    name: &str,
+    cli_input: &[String],
+    cli_output_dir: Option<&str>,
+    cli_model: Option<&str>,
+    cli_prompt: Option<&str>,
+    no_stream: bool,
+    extra_skills_dirs: &[String],
+) -> Result<()> {
+    let r = recipe::get(name)?;
+
+    // Resolve skill dependencies
+    if !r.skill_deps.is_empty() {
+        recipe::resolve_skill_deps(&r.skill_deps, extra_skills_dirs)?;
+    }
+
+    let task_prompt = if let Some(p) = cli_prompt {
+        p.to_string()
+    } else if let Some(ref pf) = r.prompt_file {
+        fs::read_to_string(pf).with_context(|| format!("read prompt file: {pf}"))?
+    } else if let Some(ref p) = r.prompt {
+        p.clone()
+    } else {
+        anyhow::bail!("recipe {name:?} has no prompt or prompt_file");
+    };
+
+    let final_input = if !cli_input.is_empty() {
+        cli_input.to_vec()
+    } else {
+        r.input.clone()
+    };
+    let final_output_dir = cli_output_dir
+        .map(|s| s.to_string())
+        .or(r.output_dir.clone());
+    let resolved_model = cli_model
+        .map(|s| s.to_string())
+        .or(r.model.clone())
+        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
+    let skills = skill::discover(extra_skills_dirs).context("discover skills")?;
+    let ws = workspace::Workspace::new()?;
+    if !final_input.is_empty() {
+        ws.stage_inputs(&final_input)?;
+    }
+
+    runner::run(&runner::Config {
+        model: resolved_model,
+        prompt: task_prompt,
+        skills,
+        work_dir: ws.dir.to_string_lossy().to_string(),
+        stream: !no_stream,
+    })?;
+
+    if let Some(ref out) = final_output_dir {
+        ws.collect_outputs(out)?;
     }
 
     Ok(())

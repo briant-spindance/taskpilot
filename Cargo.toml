@@ -19,3 +19,4 @@ walkdir = "2"
 colored = "2"
 dotenvy = "0.15"
 toml = "0.8"
+ureq = { version = "2", features = ["json"] }

@@ -1,5 +1,25 @@
+[recipes.clean-data]
+prompt = """
+Read sales_data.csv, remove any rows with missing values,
+normalize the date column to YYYY-MM-DD format,
+and write the result to cleaned_data.csv
+"""
+input = ["test/input/sales_data.csv"]
+output_dir = "test/staging"
+
 [recipes.sales-report]
 prompt_file = "test/prompt.md"
-input = ["test/input/sales_data.csv"]
+input = ["test/staging/cleaned_data.csv"]
 output_dir = "test/output"
 skill_deps = ["markdown-report"]
+depends_on = ["clean-data"]
+
+[recipes.executive-summary]
+prompt = """
+Read the sales report markdown files in the working directory
+and produce a one-page executive-summary.md with key takeaways,
+top-line metrics, and recommended actions
+"""
+input = ["test/output/"]
+output_dir = "test/output"
+depends_on = ["sales-report"]

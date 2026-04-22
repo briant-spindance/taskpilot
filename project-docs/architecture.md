@@ -48,13 +48,15 @@ CLI entry point using clap (derive API). Defines the following command paths:
 
 - `taskpilot run [RECIPE]` — execute a named recipe from `taskpilot.toml`, or an ad-hoc task with flags
 - `taskpilot recipes` — list all recipes defined in `taskpilot.toml`
+- `taskpilot doctor` — validate `taskpilot.toml` and check environment
+- `taskpilot init` — scaffold a new `taskpilot.toml` with an example recipe
 - `taskpilot skills list` — print discovered skills (name + description)
 - `taskpilot skills show <name>` — print resolved path and frontmatter
 - `taskpilot skills find <query>` — search the skills.sh registry
 - `taskpilot skills add <source>` — install a skill from GitHub
 - `taskpilot install <path>` — install a skill from a local directory
 
-Parses flags (`--prompt`, `--prompt-file`, `--input`, `--output-dir`, `--model`, `--dry-run`), loads recipes from `taskpilot.toml` when a recipe name is given, merges CLI flags over recipe defaults, and delegates to library modules.
+Parses flags (`--prompt`, `--prompt-file`, `--input`, `--output-dir`, `--model`, `--dry-run`, `--no-stream`), loads recipes from `taskpilot.toml` when a recipe name is given, merges CLI flags over recipe defaults, resolves `depends_on` chains before execution, and delegates to library modules.
 
 ### `src/recipe.rs`
 
@@ -62,11 +64,15 @@ Manages the recipe system powered by `taskpilot.toml`:
 
 **Loading.** Parses the TOML file from the current directory into a `HashMap<String, Recipe>`.
 
-**Recipe struct.** Each recipe has optional fields: `prompt`, `prompt_file`, `input` (array), `output_dir`, `model`, and `skill_deps` (array).
+**Recipe struct.** Each recipe has optional fields: `prompt`, `prompt_file`, `input` (array), `output_dir`, `model`, `skill_deps` (array), and `depends_on` (array of recipe names).
 
 **Skill dependency resolution.** Before executing a recipe, checks each entry in `skill_deps`:
 - Bare names (e.g. `"pdf"`) — verifies the skill is installed locally. Errors with install suggestions if missing.
 - Remote sources (e.g. `"anthropics/skills/pdf"`) — checks if installed, prompts the user to choose global or local installation if missing, then auto-installs via the registry.
+
+**Recipe chaining (`depends_on`).** Recipes can declare dependencies on other recipes. Before running, taskpilot performs a topological sort to determine execution order and detects circular dependencies. Dependencies run sequentially in order; each manages its own input/output paths independently (execution order only, no automatic output wiring).
+
+**Init.** The `init` command scaffolds a new `taskpilot.toml` with a commented example recipe including `depends_on`.
 
 ### `src/registry.rs`
 
@@ -97,13 +103,15 @@ Handles interaction with the skills.sh registry and GitHub:
 Drives the agentic loop:
 
 1. Assembles the system prompt (skill catalog + activation instructions).
-2. Sends messages to the Anthropic API (`/v1/messages`) via `reqwest`.
-3. Inspects the response for tool-use blocks.
-4. Dispatches each tool call to `src/tools.rs`.
-5. Appends tool results to the conversation and loops.
-6. Terminates when `stop_reason == "end_turn"`.
+2. Sends messages to the Anthropic API (`/v1/messages`).
+3. **Streaming mode** (default): Uses SSE streaming via `ureq`. Text deltas are printed to stderr in real-time as the model generates them. Tool-use blocks are accumulated until complete, then dispatched.
+4. **Non-streaming mode** (`--no-stream`): Uses `reqwest` blocking client. Waits for the full response before printing text and processing tool calls. Useful for CI/pipelines.
+5. Inspects the response for tool-use blocks.
+6. Dispatches each tool call to `src/tools.rs`.
+7. Appends tool results to the conversation and loops.
+8. Terminates when `stop_reason == "end_turn"`.
 
-Owns the `reqwest::blocking::Client`. Configurable model via `--model` flag (default: `claude-sonnet-4-20250514`). Requires `ANTHROPIC_API_KEY`.
+Configurable model via `--model` flag (default: `claude-sonnet-4-20250514`). Requires `ANTHROPIC_API_KEY`.
 
 ### `src/tools.rs`
 
@@ -195,7 +203,8 @@ User invokes CLI
 | `clap` (derive) | CLI argument parsing and subcommands |
 | `serde` + `serde_json` | JSON serialization for Anthropic API |
 | `serde_yaml` | YAML frontmatter parsing in SKILL.md |
-| `reqwest` (blocking) | HTTP client for Anthropic API and skills.sh registry |
+| `reqwest` (blocking) | HTTP client for Anthropic API (non-streaming) and skills.sh registry |
+| `ureq` | HTTP client for Anthropic API streaming (SSE) |
 | `tempfile` | Workspace temp directory management |
 | `anyhow` | Ergonomic error handling |
 | `walkdir` | Recursive directory traversal for resource enumeration |
@@ -221,3 +230,4 @@ User invokes CLI
 | `.env` file | Optional. Loaded automatically for API key and other env vars. |
 | `taskpilot.toml` | Optional. Defines named recipes with prompts, inputs, outputs, and skill deps. |
 | `--model` flag | Optional. Select Anthropic model (default: `claude-sonnet-4-20250514`). |
+| `--no-stream` flag | Optional. Disable streaming output (wait for full response). |
