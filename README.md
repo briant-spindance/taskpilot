@@ -4,16 +4,16 @@
 
 # taskpilot
 
-Taskpilot is a CLI tool that executes [Agent Skills](https://agentskills.io) as standalone, headless agentic tasks. Think of it as a Makefile for AI work — give it a prompt and input files, and it drives a full tool-use loop against the Anthropic API until the task is complete.
+A headless, scriptable agentic task runner. Give it a prompt and input files, and it drives a full tool-use loop against the Anthropic API until the task is complete. Think of it as a Makefile for AI work.
 
-taskpilot is a skill *client*, not a skill *host*. It discovers installed skills, assembles context for the model, manages the agentic loop, and stages files in and out of an isolated workspace.
+taskpilot is generic — it knows nothing about specific domains, output formats, or workflows. It assembles context, manages the agentic loop, stages files in and out, and gets out of the way. [Agent Skills](https://agentskills.io) can be installed to give the agent specialized procedural knowledge, but they're optional — taskpilot works just as well with a plain prompt.
 
 ## Install
 
 Requires [Rust](https://rustup.rs).
 
 ```bash
-git clone <repo-url> && cd skillsrunner
+git clone <repo-url> && cd taskpilot
 
 # Local build
 ./install.sh
@@ -28,19 +28,56 @@ git clone <repo-url> && cd skillsrunner
 # First-time setup (creates ~/.local/taskpilot/config.yml)
 taskpilot config
 
-# Run an ad-hoc task (--allow-bash enables shell commands)
-taskpilot run --prompt "Summarize this data" --input data.csv --output-dir out/ --allow-bash
+# Run an ad-hoc task
+taskpilot run --prompt "Summarize this data" --input data.csv --output-dir out/
 
-# Run a named recipe (bash permission is set per-recipe in taskpilot.toml)
+# Enable shell commands when the task needs them
+taskpilot run --prompt "Run the analysis script" --input data.csv --output-dir out/ --allow-bash
+
+# Run a named recipe from taskpilot.toml
 taskpilot run sales-report
 
-# Dry run (show resolved config without executing)
+# Dry run — show resolved config without executing
 taskpilot run sales-report --dry-run
 ```
 
+## Core Concepts
+
+### The Agentic Loop
+
+taskpilot drives a standard tool-use loop:
+
+1. Creates an isolated temp workspace and stages your input files
+2. Builds a system prompt (with skill instructions if any skills are installed)
+3. Sends the prompt and context to the Anthropic API
+4. Executes tool calls (`read_file`, `write_file`, `bash`) as the model issues them
+5. Continues until the model signals completion (`end_turn`)
+6. Collects output files from the workspace to your specified output directory
+
+The agent operates entirely within a sandboxed temp directory. Your filesystem is not modified outside the specified output directory (unless bash is enabled — see [Security](#security)).
+
+### File I/O
+
+Input files are copied into the workspace before the task starts. The agent reads and writes files within this sandbox. At completion, everything in the workspace is collected to `--output-dir`.
+
+This makes taskpilot composable with shell scripts, Makefiles, and CI pipelines — the interface is just files in, files out.
+
+```bash
+# Process a CSV → produce a report
+taskpilot run --prompt "Analyze this data" --input data.csv --output-dir results/
+
+# Chain tasks through the filesystem
+taskpilot run --prompt "Clean the data" --input raw.csv --output-dir staging/
+taskpilot run --prompt "Generate a report" --input staging/cleaned.csv --output-dir output/
+```
+
+### Streaming
+
+Output streams in real-time by default — text appears as the model generates it. Use `--no-stream` to wait for complete responses (useful in CI/pipelines).
+
 ## Recipes
 
-Recipes turn one-off prompts into repeatable, version-controlled tasks. Define them in `taskpilot.toml` at the root of your project and run them by name.
+Recipes turn ad-hoc prompts into repeatable, version-controlled tasks. Define them in `taskpilot.toml` at the root of your project and run them by name.
 
 ```bash
 # Scaffold a starter taskpilot.toml
@@ -160,21 +197,19 @@ The `doctor` command validates that all `depends_on` references exist and that t
 taskpilot doctor
 ```
 
-### Skill dependencies
-
-When a recipe declares `skill_deps`, taskpilot checks that each skill is installed before running. If a dependency uses the `owner/repo/skill` format and is missing, taskpilot prompts you to install it globally (`~/.agents/skills/`) or locally (`./.agents/skills/`).
-
-```toml
-[recipes.quarterly-deck]
-prompt = "Create a quarterly results presentation"
-skill_deps = ["anthropics/skills/powerpoint-automation"]
-```
-
 ## Skills
 
-taskpilot uses [Agent Skills](https://agentskills.io) — a portable, open format for giving AI agents procedural knowledge. Skills are directories containing a `SKILL.md` file with instructions, and optionally bundled scripts, references, and assets.
+taskpilot optionally integrates with [Agent Skills](https://agentskills.io) — a portable, open format for giving AI agents procedural knowledge. Skills are directories containing a `SKILL.md` file with instructions, and optionally bundled scripts, references, and assets.
 
-The [skills.sh](https://skills.sh) registry is a public index of community and official skills. taskpilot integrates with it natively — no Node.js or `npx` required.
+**Skills are not required.** taskpilot runs any task with just a prompt and input files. Skills add specialized instructions that help the model handle complex domains (PDF generation, Excel manipulation, PowerPoint design, etc.) more reliably.
+
+### How skills work
+
+When taskpilot starts a task, it injects a catalog of all discovered skills (name and description only) into the system prompt. The model reads your prompt, decides which skills are relevant, and activates them by calling the `activate_skill` tool. This loads the full `SKILL.md` instructions and any bundled resources into the conversation.
+
+You don't choose which skills to use — the model does. A prompt like *"create a PDF report from this data"* will cause the model to activate a PDF skill if one is installed, without you specifying it. Multiple skills can be activated in a single session if the task calls for it.
+
+If a recipe *requires* a specific skill and shouldn't run without it, use `skill_deps` to guarantee it's installed before the prompt reaches the model.
 
 ### Discovery
 
@@ -192,55 +227,25 @@ Override with `TASKPILOT_SKILLS_DIR` or `--skills-dir` (repeatable):
 taskpilot run my-recipe --skills-dir ./test/skills --skills-dir ./extra/skills
 ```
 
-### Finding skills
+### Finding and installing skills
 
-Search the [skills.sh](https://skills.sh) registry to find skills for your task:
-
-```bash
-$ taskpilot skills find "pdf"
-  1. anthropics/skills/pdf (⬇ 1234)
-     Use this skill whenever the user wants to do anything with PDF files...
-
-  2. acme/doc-tools/pdf-merger (⬇ 89)
-     Merge and split PDF documents...
-```
+The [skills.sh](https://skills.sh) registry is a public index of community and official skills. taskpilot integrates with it natively — no Node.js or `npx` required.
 
 ```bash
-$ taskpilot skills find "excel"
-  1. anthropics/skills/excel-automation (⬇ 567)
-     Create and manipulate Excel spreadsheets...
-```
+# Search the registry
+taskpilot skills find "pdf"
 
-```bash
-$ taskpilot skills find "powerpoint presentation"
-  1. anthropics/skills/elite-powerpoint-designer (⬇ 432)
-     Create world-class PowerPoint presentations...
-
-  2. anthropics/skills/powerpoint-automation (⬇ 301)
-     Create professional PowerPoint presentations from various sources...
-```
-
-### Installing skills
-
-Install a skill from the registry using the `owner/repo/skill` format:
-
-```bash
 # Install to project (./.agents/skills/)
 taskpilot skills add anthropics/skills/pdf
 
 # Install globally (~/.agents/skills/)
 taskpilot skills add anthropics/skills/pdf --global
+
+# Install from a local directory
+taskpilot skills install ./path/to/my-skill
 ```
 
-taskpilot downloads the skill directly from GitHub — no intermediary package manager needed.
-
-You can also install from a local directory:
-
-```bash
-taskpilot install ./path/to/my-skill
-```
-
-### Listing and inspecting installed skills
+### Listing and inspecting skills
 
 ```bash
 $ taskpilot skills list
@@ -258,30 +263,16 @@ Description: Use this skill whenever the user wants to do anything with PDF file
 Path:        /Users/you/.agents/skills/pdf
 ```
 
-### Skill activation
-
-You don't choose which skills to use — the model does. When taskpilot starts a task, it injects a catalog of all discovered skills (name and description) into the system prompt. The model reads your prompt, decides which skills are relevant, and activates them on its own by calling the `activate_skill` tool. This loads the full `SKILL.md` instructions and any bundled scripts, references, or assets into the conversation.
-
-This means you can install a broad set of skills and let the model pick the right ones for each task. A prompt like *"create a PDF report from this data"* will cause the model to activate a PDF skill if one is installed, without you having to specify it. Multiple skills can be activated in a single session if the task calls for it.
-
-If a task *requires* a specific skill and shouldn't run without it, use `skill_deps` in your recipe. This guarantees the skill is installed before the prompt ever reaches the model — taskpilot will error or prompt you to install it rather than letting the model attempt the task without the right instructions.
-
-## Streaming
-
-Output streams in real-time by default. Text appears as the model generates it. Use `--no-stream` to wait for complete responses (useful in CI/pipelines).
-
 ## Agent Tools
 
 During a task, the model has access to these tools:
 
 | Tool | Default | Description |
 |------|---------|-------------|
-| `read_file` | enabled | Read the contents of a file. Path must be relative to the workspace — attempts to read outside the sandbox are rejected. |
-| `write_file` | enabled | Write content to a file. Creates parent directories automatically. Same sandboxing rules as `read_file`. |
-| `activate_skill` | enabled | Load a skill by name from the discovered catalog. Returns the full `SKILL.md` instructions and a listing of bundled resources (scripts, references, assets). The model calls this when it determines a skill is relevant to the task. |
-| `bash` | **disabled** | Execute any shell command in the workspace directory. Returns stdout, stderr, and exit code. Must be explicitly enabled (see Security below). |
-
-All file operations (`read_file`, `write_file`) are sandboxed to the workspace directory and cannot access files outside it. However, if the `bash` tool is enabled, the agent can bypass this sandbox entirely — see [Security](#security) below.
+| `read_file` | enabled | Read a file in the workspace. Path must be relative — escapes are rejected. |
+| `write_file` | enabled | Write content to a file. Creates parent directories automatically. Same sandboxing as `read_file`. |
+| `activate_skill` | enabled | Load a skill by name from the discovered catalog. Returns the full instructions and bundled resources. |
+| `bash` | **disabled** | Execute a shell command in the workspace. Returns stdout, stderr, and exit code. Must be explicitly enabled. |
 
 ## Security
 
@@ -323,9 +314,9 @@ Precedence: `--allow-bash` flag > recipe `allow_bash` field > config.yml `allow_
 
 - **Leave bash disabled** for tasks that only need to read and write files (summarization, formatting, simple transformations)
 - **Enable bash per-recipe** rather than globally — this makes it explicit which tasks have shell access
-- **Be cautious with untrusted inputs** — a malicious file (e.g. a CSV with crafted content) could influence the model to run harmful commands when bash is enabled
-- **Review skills before installing** — skills are arbitrary instructions that tell the model what to do. A malicious skill could instruct the model to exfiltrate data or run destructive commands
-- **Use `--dry-run`** to inspect the resolved configuration (including bash status) before executing
+- **Be cautious with untrusted inputs** — a malicious file could influence the model to run harmful commands when bash is enabled
+- **Review skills before installing** — skills are arbitrary instructions that tell the model what to do
+- **Use `--dry-run`** to inspect the resolved configuration before executing
 
 ## Commands
 
@@ -340,7 +331,8 @@ Precedence: `--allow-bash` flag > recipe `allow_bash` field > config.yml `allow_
 | `taskpilot skills show <name>` | Show skill details |
 | `taskpilot skills find <query>` | Search the skills.sh registry |
 | `taskpilot skills add <source>` | Install a skill from the registry |
-| `taskpilot install <path>` | Install a skill from a local directory |
+| `taskpilot skills install <path>` | Install a skill from a local directory |
+| `taskpilot version` | Print version information |
 
 ## Configuration
 
@@ -378,18 +370,6 @@ allow_bash: false
 | `ANTHROPIC_API_KEY` | API authentication (env var, `.env`, or config) |
 | `TASKPILOT_SKILLS_DIR` | Override user-level skills directory |
 | `taskpilot.toml` | Recipe definitions |
-
-## How it works
-
-1. Parses CLI flags or loads a recipe from `taskpilot.toml`
-2. Resolves `depends_on` chain and runs dependencies first
-3. Checks `skill_deps` are installed (prompts to install remote deps if missing)
-4. Creates an isolated temp workspace and stages input files
-5. Builds a system prompt with the skill catalog
-6. Drives a tool-use loop (`read_file`, `write_file`, and `bash` if enabled) against the Anthropic API
-7. Collects output files from the workspace to `output_dir`
-
-The agent operates in a sandboxed temp directory. Your filesystem is not modified outside the specified output directory.
 
 ## License
 
