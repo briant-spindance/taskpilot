@@ -18,23 +18,23 @@ struct RecipeFile {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct Recipe {
-    pub description: Option<String>,
-    pub prompt: Option<String>,
-    pub prompt_file: Option<String>,
+pub(crate) struct Recipe {
+    pub(crate) description: Option<String>,
+    pub(crate) prompt: Option<String>,
+    pub(crate) prompt_file: Option<String>,
     #[serde(default)]
-    pub input: Vec<String>,
-    pub output_dir: Option<String>,
-    pub model: Option<String>,
+    pub(crate) input: Vec<String>,
+    pub(crate) output_dir: Option<String>,
+    pub(crate) model: Option<String>,
     #[serde(default)]
-    pub skill_deps: Vec<String>,
+    pub(crate) skill_deps: Vec<String>,
     #[serde(default)]
-    pub depends_on: Vec<String>,
-    pub allow_bash: Option<bool>,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) allow_bash: Option<bool>,
 }
 
 /// Load and parse the taskpilot.toml file from the current directory.
-pub fn load() -> Result<HashMap<String, Recipe>> {
+pub(crate) fn load() -> Result<HashMap<String, Recipe>> {
     let path = Path::new(RECIPE_FILE);
     if !path.exists() {
         bail!("no {RECIPE_FILE} found in the current directory");
@@ -45,7 +45,7 @@ pub fn load() -> Result<HashMap<String, Recipe>> {
 }
 
 /// Look up a recipe by name.
-pub fn get(name: &str) -> Result<Recipe> {
+pub(crate) fn get(name: &str) -> Result<Recipe> {
     let recipes = load()?;
     recipes
         .get(name)
@@ -64,7 +64,7 @@ pub fn get(name: &str) -> Result<Recipe> {
 }
 
 /// List all recipes with a summary.
-pub fn list() -> Result<()> {
+pub(crate) fn list() -> Result<()> {
     let recipes = load()?;
     if recipes.is_empty() {
         println!("{}", "No recipes defined in taskpilot.toml.".dimmed());
@@ -107,7 +107,7 @@ pub fn list() -> Result<()> {
 }
 
 /// Initialize a new taskpilot.toml with an example recipe.
-pub fn init() -> Result<()> {
+pub(crate) fn init() -> Result<()> {
     let path = Path::new(RECIPE_FILE);
     if path.exists() {
         bail!("{RECIPE_FILE} already exists in the current directory");
@@ -152,7 +152,7 @@ depends_on = ["prepare-data"]
 }
 
 /// Validate taskpilot.toml and check the environment.
-pub fn doctor() -> Result<()> {
+pub(crate) fn doctor() -> Result<()> {
     let mut errors = 0u32;
     let mut warnings = 0u32;
 
@@ -328,7 +328,7 @@ pub(crate) fn print_summary(errors: u32, warnings: u32) {
 
 /// Resolve the full execution order for a recipe, honoring depends_on.
 /// Returns a topologically sorted list of recipe names ending with the target.
-pub fn resolve_depends_on(target: &str) -> Result<Vec<String>> {
+pub(crate) fn resolve_depends_on(target: &str) -> Result<Vec<String>> {
     let recipes = load()?;
 
     // Check target exists
@@ -379,14 +379,14 @@ pub fn resolve_depends_on(target: &str) -> Result<Vec<String>> {
 
 /// Check and resolve skill dependencies for a recipe.
 /// Local deps (bare names) are verified. Remote deps (with /) are auto-installed if missing.
-pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> {
+pub(crate) fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     resolve_skill_deps_with_reader(deps, extra_dirs, &mut reader)
 }
 
 /// Inner implementation that accepts an arbitrary reader for testability.
-pub fn resolve_skill_deps_with_reader(
+pub(crate) fn resolve_skill_deps_with_reader(
     deps: &[String],
     extra_dirs: &[String],
     reader: &mut dyn BufRead,

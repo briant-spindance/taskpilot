@@ -3,26 +3,25 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
+use crate::constants::DEFAULT_MODEL;
 use crate::skill::{self, Skill};
 use crate::tools;
-
-const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u64 = 8192;
 const MAX_ITERATIONS: usize = 200;
 
-pub struct Config {
-    pub model: String,
-    pub prompt: String,
-    pub skills: Vec<Skill>,
-    pub work_dir: String,
-    pub stream: bool,
-    pub allow_bash: bool,
+pub(crate) struct Config {
+    pub(crate) model: String,
+    pub(crate) prompt: String,
+    pub(crate) skills: Vec<Skill>,
+    pub(crate) work_dir: String,
+    pub(crate) stream: bool,
+    pub(crate) allow_bash: bool,
 }
 
 /// Trait abstracting API calls so the agentic loop can be tested without HTTP.
-pub trait ApiClient {
+pub(crate) trait ApiClient {
     fn call(
         &self,
         api_key: &str,
@@ -33,7 +32,7 @@ pub trait ApiClient {
 }
 
 /// Production implementation that delegates to blocking or streaming HTTP calls.
-pub struct DefaultApiClient;
+pub(crate) struct DefaultApiClient;
 
 impl ApiClient for DefaultApiClient {
     fn call(
@@ -53,12 +52,12 @@ impl ApiClient for DefaultApiClient {
 
 /// Execute the agentic loop to completion.
 #[allow(dead_code)]
-pub fn run(cfg: &Config) -> Result<()> {
+pub(crate) fn run(cfg: &Config) -> Result<()> {
     run_with_client(cfg, &DefaultApiClient)
 }
 
 /// Inner agentic loop parameterised on an [`ApiClient`].
-pub fn run_with_client(cfg: &Config, client: &dyn ApiClient) -> Result<()> {
+pub(crate) fn run_with_client(cfg: &Config, client: &dyn ApiClient) -> Result<()> {
     let api_key =
         std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is required")?;
 
@@ -156,20 +155,28 @@ pub fn run_with_client(cfg: &Config, client: &dyn ApiClient) -> Result<()> {
 
 /// Non-streaming API call. Returns (content_blocks, stop_reason).
 fn call_blocking(api_key: &str, body: &Value, iteration: usize) -> Result<(Value, String)> {
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(API_URL)
-        .header("content-type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", API_VERSION)
-        .json(body)
-        .send()
-        .with_context(|| format!("API call {iteration}"))?;
+    let body_str = serde_json::to_string(body)?;
 
-    let status = resp.status();
-    let resp_body: Value = resp.json().context("parse API response")?;
+    let resp = ureq::post(API_URL)
+        .set("content-type", "application/json")
+        .set("x-api-key", api_key)
+        .set("anthropic-version", API_VERSION)
+        .send_string(&body_str);
 
-    parse_blocking_response(status.as_u16(), &resp_body)
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let resp_body: Value = r.into_json().context("parse API response")?;
+            parse_blocking_response(status, &resp_body)
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let resp_body: Value = r.into_json().unwrap_or(json!({"error": "unknown"}));
+            parse_blocking_response(code, &resp_body)
+        }
+        Err(e) => {
+            anyhow::bail!("API call {iteration}: {e}")
+        }
+    }
 }
 
 /// Parse a blocking API response. Extracted for testability.
@@ -383,38 +390,9 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use serde_json::json;
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
     use std::path::PathBuf;
 
-    // ---- Mock ApiClient ----
-
-    struct MockApiClient {
-        responses: RefCell<VecDeque<Result<(Value, String)>>>,
-    }
-
-    impl MockApiClient {
-        fn new(responses: Vec<Result<(Value, String)>>) -> Self {
-            Self {
-                responses: RefCell::new(responses.into()),
-            }
-        }
-    }
-
-    impl ApiClient for MockApiClient {
-        fn call(
-            &self,
-            _api_key: &str,
-            _body: &Value,
-            _stream: bool,
-            _iteration: usize,
-        ) -> Result<(Value, String)> {
-            self.responses
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or_else(|| bail!("no more mock responses"))
-        }
-    }
+    use crate::testutil::MockApiClient;
 
     fn make_cfg(work_dir: &str) -> Config {
         Config {

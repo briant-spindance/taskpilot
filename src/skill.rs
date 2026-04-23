@@ -6,11 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::constants::{AGENTS_DIR, RESOURCE_DIRS, SKILL_FILE, SKILLS_DIR};
+
 #[derive(Debug, Clone)]
-pub struct Skill {
-    pub name: String,
-    pub description: String,
-    pub path: PathBuf,
+pub(crate) struct Skill {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -23,20 +25,20 @@ struct Frontmatter {
 
 /// Discover all skills from the standard search directories.
 /// Extra directories (e.g. from --skills-dir flags) are appended to the search path.
-pub fn discover(extra_dirs: &[String]) -> Result<Vec<Skill>> {
+pub(crate) fn discover(extra_dirs: &[String]) -> Result<Vec<Skill>> {
     let home = dirs_path()?;
     let cwd = env::current_dir().context("resolve working dir")?;
 
     let mut search_dirs = vec![
-        cwd.join(".agents").join("skills"),
-        cwd.join(".taskpilot").join("skills"),
-        home.join(".agents").join("skills"),
+        cwd.join(AGENTS_DIR).join(SKILLS_DIR),
+        cwd.join(".taskpilot").join(SKILLS_DIR),
+        home.join(AGENTS_DIR).join(SKILLS_DIR),
     ];
 
     if let Ok(override_dir) = env::var("TASKPILOT_SKILLS_DIR") {
         search_dirs.push(PathBuf::from(override_dir));
     } else {
-        search_dirs.push(home.join(".taskpilot").join("skills"));
+        search_dirs.push(home.join(".taskpilot").join(SKILLS_DIR));
     }
 
     for dir in extra_dirs {
@@ -60,7 +62,7 @@ pub fn discover(extra_dirs: &[String]) -> Result<Vec<Skill>> {
                 continue;
             }
             let skill_dir = entry.path();
-            let skill_file = skill_dir.join("SKILL.md");
+            let skill_file = skill_dir.join(SKILL_FILE);
             if !skill_file.exists() {
                 continue;
             }
@@ -75,8 +77,8 @@ pub fn discover(extra_dirs: &[String]) -> Result<Vec<Skill>> {
 }
 
 /// Parse a SKILL.md from the given directory.
-pub fn parse(skill_dir: &Path) -> Result<Skill> {
-    let skill_file = skill_dir.join("SKILL.md");
+pub(crate) fn parse(skill_dir: &Path) -> Result<Skill> {
+    let skill_file = skill_dir.join(SKILL_FILE);
     let content = fs::read_to_string(&skill_file).context("read SKILL.md")?;
     let fallback_name = skill_dir
         .file_name()
@@ -108,7 +110,7 @@ pub fn parse(skill_dir: &Path) -> Result<Skill> {
 }
 
 /// Build catalog entries (name + description) for the system prompt.
-pub fn build_catalog(skills: &[Skill]) -> Vec<(String, String)> {
+pub(crate) fn build_catalog(skills: &[Skill]) -> Vec<(String, String)> {
     skills
         .iter()
         .map(|s| (s.name.clone(), s.description.clone()))
@@ -116,7 +118,7 @@ pub fn build_catalog(skills: &[Skill]) -> Vec<(String, String)> {
 }
 
 /// Find a skill by name.
-pub fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Result<&'a Skill> {
+pub(crate) fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Result<&'a Skill> {
     skills
         .iter()
         .find(|s| s.name == name)
@@ -124,8 +126,8 @@ pub fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Result<&'a Skill> {
 }
 
 /// Activate a skill: read full SKILL.md and enumerate resources.
-pub fn activate(skill: &Skill) -> Result<String> {
-    let content = fs::read_to_string(skill.path.join("SKILL.md")).context("read SKILL.md")?;
+pub(crate) fn activate(skill: &Skill) -> Result<String> {
+    let content = fs::read_to_string(skill.path.join(SKILL_FILE)).context("read SKILL.md")?;
     let resources = enumerate_resources(&skill.path);
 
     let mut out = format!("<skill_content name={:?}>\n{}\n", skill.name, content);
@@ -142,7 +144,7 @@ pub fn activate(skill: &Skill) -> Result<String> {
 
 pub(crate) fn enumerate_resources(skill_dir: &Path) -> Vec<String> {
     let mut resources = Vec::new();
-    for subdir in &["scripts", "references", "assets"] {
+    for subdir in RESOURCE_DIRS {
         let base = skill_dir.join(subdir);
         if !base.exists() {
             continue;
@@ -159,9 +161,7 @@ pub(crate) fn enumerate_resources(skill_dir: &Path) -> Vec<String> {
 }
 
 pub(crate) fn dirs_path() -> Result<PathBuf> {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .context("resolve home directory")
+    crate::constants::home_dir()
 }
 
 #[cfg(test)]

@@ -1,10 +1,12 @@
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use crate::constants::{AGENTS_DIR, SKILL_FILE, SKILLS_DIR};
 
 const SEARCH_API: &str = "https://skills.sh/api/search";
 const GITHUB_API: &str = "https://api.github.com";
@@ -17,42 +19,48 @@ pub(crate) trait HttpClient {
 }
 
 struct RealHttpClient {
-    client: Client,
+    agent: ureq::Agent,
 }
 
 impl RealHttpClient {
     fn new() -> Result<Self> {
-        let client = Client::builder()
+        let agent = ureq::AgentBuilder::new()
             .user_agent("taskpilot")
-            .build()
-            .context("build HTTP client")?;
-        Ok(Self { client })
+            .build();
+        Ok(Self { agent })
     }
 }
 
 impl HttpClient for RealHttpClient {
     fn get_json(&self, url: &str, query: &[(&str, &str)]) -> Result<Value> {
-        let resp = self
-            .client
-            .get(url)
-            .query(query)
-            .send()
-            .context("HTTP GET")?;
-        if !resp.status().is_success() {
-            bail!("HTTP {} for {url}", resp.status());
+        let mut req = self.agent.get(url);
+        for (k, v) in query {
+            req = req.query(k, v);
         }
-        resp.json().context("parse JSON")
+        match req.call() {
+            Ok(resp) => resp.into_json().context("parse JSON"),
+            Err(ureq::Error::Status(code, _resp)) => {
+                bail!("HTTP {code} for {url}")
+            }
+            Err(e) => bail!("HTTP GET: {e}"),
+        }
     }
 
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.client.get(url).send().context("HTTP GET bytes")?;
-        let bytes = resp.bytes().context("read bytes")?;
-        Ok(bytes.to_vec())
+        let resp = self.agent.get(url).call().map_err(|e| anyhow::anyhow!("HTTP GET bytes: {e}"))?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut bytes)
+            .context("read bytes")?;
+        Ok(bytes)
     }
 
     fn check_exists(&self, url: &str) -> Result<bool> {
-        let resp = self.client.get(url).send().context("check exists")?;
-        Ok(resp.status().is_success())
+        match self.agent.get(url).call() {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(_, _)) => Ok(false),
+            Err(e) => bail!("check exists: {e}"),
+        }
     }
 }
 
@@ -87,7 +95,7 @@ impl SearchResult {
 }
 
 /// Search the skills.sh registry and print results.
-pub fn find(query: &str) -> Result<()> {
+pub(crate) fn find(query: &str) -> Result<()> {
     let client = RealHttpClient::new()?;
     find_with_client(query, &client)
 }
@@ -134,7 +142,7 @@ fn find_with_client(query: &str, client: &dyn HttpClient) -> Result<()> {
 }
 
 /// Download and install a skill from a GitHub repository.
-pub fn add(source: &str, global: bool) -> Result<()> {
+pub(crate) fn add(source: &str, global: bool) -> Result<()> {
     let client = RealHttpClient::new()?;
     add_with_client(source, global, &client)
 }
@@ -162,9 +170,9 @@ fn add_with_client(source: &str, global: bool, client: &dyn HttpClient) -> Resul
     download_dir(client, &owner, &repo, &remote_path, &dest)?;
 
     // Verify SKILL.md exists
-    if !dest.join("SKILL.md").exists() {
+    if !dest.join(SKILL_FILE).exists() {
         let _ = fs::remove_dir_all(&dest);
-        bail!("downloaded directory does not contain SKILL.md");
+        bail!("downloaded directory does not contain {SKILL_FILE}");
     }
 
     eprintln!(
@@ -287,12 +295,12 @@ fn resolve_skill_path(
 
     // No skill specified — check if root has SKILL.md
     let contents = list_github_dir(client, owner, repo, "")?;
-    if contents.iter().any(|c| c.name == "SKILL.md") {
+    if contents.iter().any(|c| c.name == SKILL_FILE) {
         let name = repo.to_string();
         return Ok(("".to_string(), name));
     }
 
-    bail!("no skill name specified and repo root has no SKILL.md; use owner/repo@skill format");
+    bail!("no skill name specified and repo root has no {SKILL_FILE}; use owner/repo@skill format");
 }
 
 fn remote_dir_exists(
@@ -350,11 +358,11 @@ fn download_dir(
 
 pub(crate) fn install_dir(global: bool) -> Result<PathBuf> {
     if global {
-        let home = std::env::var("HOME").context("resolve home")?;
-        Ok(PathBuf::from(home).join(".agents").join("skills"))
+        let home = crate::constants::home_dir()?;
+        Ok(home.join(AGENTS_DIR).join(SKILLS_DIR))
     } else {
         let cwd = std::env::current_dir().context("resolve cwd")?;
-        Ok(cwd.join(".agents").join("skills"))
+        Ok(cwd.join(AGENTS_DIR).join(SKILLS_DIR))
     }
 }
 
@@ -366,6 +374,46 @@ pub(crate) fn format_installs(n: u64) -> String {
     } else {
         format!("{n} installs")
     }
+}
+
+/// Install a skill from a local directory into ~/.agents/skills/<name>.
+pub(crate) fn from_local(src_dir: &str) -> Result<()> {
+    let src = Path::new(src_dir);
+    if !src.join(SKILL_FILE).exists() {
+        bail!("source is not a valid skill (no SKILL.md)");
+    }
+
+    let name = src
+        .file_name()
+        .context("invalid source path")?
+        .to_string_lossy();
+
+    let home = crate::constants::home_dir()?;
+    let dest = home
+        .join(AGENTS_DIR)
+        .join(SKILLS_DIR)
+        .join(name.as_ref());
+
+    // Remove existing
+    let _ = fs::remove_dir_all(&dest);
+
+    copy_dir(src, &dest).context("copy skill")?;
+
+    eprintln!("Installed skill {name:?} to {}", dest.display());
+    Ok(())
+}
+
+pub(crate) fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)?.flatten() {
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1003,5 +1051,106 @@ mod tests {
             source: "foo/bar".into(),
         };
         assert_eq!(sr.source_with_skill(), "foo/bar/baz");
+    }
+
+    // ── from_local ──────────────────────────────────────────────
+
+    /// Helper: set HOME to a temp dir and return it (keeps it alive).
+    fn redirect_home() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        tmp
+    }
+
+    #[test]
+    #[serial]
+    fn from_local_valid_skill() {
+        let home = redirect_home();
+        let src = tempfile::TempDir::new().unwrap();
+        fs::write(src.path().join("SKILL.md"), "# My Skill").unwrap();
+        fs::write(src.path().join("extra.txt"), "data").unwrap();
+
+        from_local(src.path().to_str().unwrap()).unwrap();
+
+        let name = src.path().file_name().unwrap().to_string_lossy();
+        let installed = home.path().join(".agents/skills").join(name.as_ref());
+        assert!(installed.join("SKILL.md").exists());
+        assert!(installed.join("extra.txt").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn from_local_no_skill_md() {
+        let _home = redirect_home();
+        let src = tempfile::TempDir::new().unwrap();
+
+        let err = from_local(src.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("no SKILL.md"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_local_invalid_source_path() {
+        let _home = redirect_home();
+        let err = from_local("/").unwrap_err();
+        assert!(
+            err.to_string().contains("no SKILL.md"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── copy_dir ────────────────────────────────────────────────
+
+    #[test]
+    fn copy_dir_flat_files() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let dst_target = dst.path().join("out");
+
+        fs::write(src.path().join("a.txt"), "aaa").unwrap();
+        fs::write(src.path().join("b.txt"), "bbb").unwrap();
+
+        copy_dir(src.path(), &dst_target).unwrap();
+
+        assert_eq!(fs::read_to_string(dst_target.join("a.txt")).unwrap(), "aaa");
+        assert_eq!(fs::read_to_string(dst_target.join("b.txt")).unwrap(), "bbb");
+    }
+
+    #[test]
+    fn copy_dir_nested() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let dst_target = dst.path().join("out");
+
+        let sub = src.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("nested.txt"), "deep").unwrap();
+        fs::write(src.path().join("top.txt"), "top").unwrap();
+
+        copy_dir(src.path(), &dst_target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dst_target.join("sub/nested.txt")).unwrap(),
+            "deep"
+        );
+        assert_eq!(
+            fs::read_to_string(dst_target.join("top.txt")).unwrap(),
+            "top"
+        );
+    }
+
+    #[test]
+    fn copy_dir_empty() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+        let dst_target = dst.path().join("out");
+
+        copy_dir(src.path(), &dst_target).unwrap();
+
+        assert!(dst_target.exists());
+        assert!(fs::read_dir(&dst_target).unwrap().next().is_none());
     }
 }

@@ -1,8 +1,10 @@
+<p align="center">
+  <img src="assets/taskpilot_white_logo.png" alt="taskpilot" width="400">
+</p>
+
 # taskpilot
 
-*Sometimes you don't need to talk to your agent — you just need it to do the work.*
-
-A CLI tool that executes [Agent Skills](https://agentskills.io) as standalone, headless agentic tasks. Think of it as a Makefile for AI work — give it a prompt and input files, and it drives a full tool-use loop against the Anthropic API until the task is complete.
+Taskpilot is a CLI tool that executes [Agent Skills](https://agentskills.io) as standalone, headless agentic tasks. Think of it as a Makefile for AI work — give it a prompt and input files, and it drives a full tool-use loop against the Anthropic API until the task is complete.
 
 taskpilot is a skill *client*, not a skill *host*. It discovers installed skills, assembles context for the model, manages the agentic loop, and stages files in and out of an isolated workspace.
 

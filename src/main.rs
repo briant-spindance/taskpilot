@@ -1,5 +1,6 @@
 mod config;
-mod install;
+mod constants;
+mod pipeline;
 mod recipe;
 mod registry;
 mod runner;
@@ -7,13 +8,15 @@ mod skill;
 mod tools;
 mod workspace;
 
-use anyhow::{Context, Result};
+#[cfg(test)]
+mod testutil;
+
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use std::fs;
 
 #[derive(Parser)]
-#[command(name = "taskpilot", about = "Execute Agent Skills as standalone agentic tasks")]
+#[command(name = "taskpilot", about = "Execute Agent Skills as standalone agentic tasks", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -82,6 +85,8 @@ enum Commands {
     /// Set up global config (~/.local/taskpilot/config.yml)
     Config,
 
+    /// Print version information
+    Version,
 }
 
 #[derive(Subcommand)]
@@ -140,7 +145,7 @@ fn dispatch_command(
 ) -> Result<()> {
     match command {
         Commands::Run {
-            recipe: recipe_name,
+            recipe,
             prompt,
             prompt_file,
             input,
@@ -149,132 +154,12 @@ fn dispatch_command(
             dry_run,
             no_stream,
             skills_dir,
-            allow_bash: cli_allow_bash,
+            allow_bash,
         } => {
-            // If a recipe name is given, load it and merge with CLI flags
-            let (task_prompt, final_input, final_output_dir, final_model, recipe_allow_bash) =
-                if let Some(ref name) = recipe_name {
-                    // Resolve depends_on chain first
-                    let execution_order = recipe::resolve_depends_on(name)?;
-
-                    // Run all dependencies (everything except the last, which is the target)
-                    if execution_order.len() > 1 {
-                        let deps = &execution_order[..execution_order.len() - 1];
-                        eprintln!(
-                            "{}",
-                            format!("Running {} dependencies first...", deps.len()).dimmed()
-                        );
-                        for dep_name in deps {
-                            eprintln!("\n{} {}", "▶ dependency:".cyan().bold(), dep_name.bold());
-                            run_recipe(dep_name, &[], None, None, None, no_stream, &skills_dir, &global_config, api_client)?;
-                        }
-                        eprintln!("\n{} {}", "▶ target:".green().bold(), name.bold());
-                    }
-
-                    let r = recipe::get(name)?;
-
-                    // Resolve skill dependencies before running
-                    if !r.skill_deps.is_empty() {
-                        eprintln!("{}", "Checking skill dependencies...".dimmed());
-                        recipe::resolve_skill_deps(&r.skill_deps, &skills_dir)?;
-                        eprintln!();
-                    }
-
-                    // CLI flags override recipe values
-                    let p = if let Some(ref pf) = prompt_file {
-                        fs::read_to_string(pf)
-                            .with_context(|| format!("read prompt file: {pf}"))?
-                    } else if let Some(ref p) = prompt {
-                        p.clone()
-                    } else if let Some(ref pf) = r.prompt_file {
-                        fs::read_to_string(pf)
-                            .with_context(|| format!("read prompt file: {pf}"))?
-                    } else if let Some(ref p) = r.prompt {
-                        p.clone()
-                    } else {
-                        anyhow::bail!("recipe {name:?} has no prompt or prompt_file");
-                    };
-
-                    let inp = if !input.is_empty() { input } else { r.input.clone() };
-                    let out = output_dir.or(r.output_dir.clone());
-                    let mdl = model.or(r.model.clone());
-
-                    (p, inp, out, mdl, r.allow_bash)
-                } else {
-                    // No recipe — pure flag-based run
-                    let p = if let Some(pf) = prompt_file {
-                        fs::read_to_string(&pf)
-                            .with_context(|| format!("read prompt file: {pf}"))?
-                    } else if let Some(p) = prompt {
-                        p
-                    } else {
-                        anyhow::bail!("--prompt or --prompt-file is required (or use a recipe name)");
-                    };
-
-                    (p, input, output_dir, model, None)
-                };
-
-            let resolved_model = final_model
-                .or(global_config.model.clone())
-                .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
-
-            let use_stream = if no_stream {
-                false
-            } else {
-                global_config.stream.unwrap_or(true)
-            };
-
-            // Resolve allow_bash: CLI flag > recipe field > config.yml > default (false)
-            let allow_bash = if cli_allow_bash {
-                true
-            } else {
-                recipe_allow_bash
-                    .or(global_config.allow_bash)
-                    .unwrap_or(false)
-            };
-
-            // Discover skills
-            let skills = skill::discover(&skills_dir).context("discover skills")?;
-
-            if dry_run {
-                println!("=== Dry Run ===");
-                if let Some(ref name) = recipe_name {
-                    println!("Recipe: {name}");
-                }
-                println!("Model: {resolved_model}");
-                println!("Prompt: {task_prompt}");
-                println!("Skills: {} discovered", skills.len());
-                for s in &skills {
-                    println!("  - {} ({})", s.name, s.path.display());
-                }
-                println!("Inputs: {final_input:?}");
-                println!("Output dir: {}", final_output_dir.as_deref().unwrap_or("(none)"));
-                println!("Bash: {}", if allow_bash { "enabled" } else { "disabled" });
-                return Ok(());
-            }
-
-            // Create workspace
-            let ws = workspace::Workspace::new()?;
-
-            // Stage inputs
-            if !final_input.is_empty() {
-                ws.stage_inputs(&final_input)?;
-            }
-
-            // Run agentic loop
-            runner::run_with_client(&runner::Config {
-                model: resolved_model,
-                prompt: task_prompt,
-                skills,
-                work_dir: ws.dir.to_string_lossy().to_string(),
-                stream: use_stream,
-                allow_bash,
-            }, api_client)?;
-
-            // Collect outputs
-            if let Some(ref out) = final_output_dir {
-                ws.collect_outputs(out)?;
-            }
+            pipeline::run_command(
+                recipe, prompt, prompt_file, input, output_dir, model, dry_run, no_stream,
+                skills_dir, allow_bash, global_config, api_client,
+            )?;
         }
 
         Commands::Recipes => {
@@ -324,7 +209,7 @@ fn dispatch_command(
                 registry::add(&source, global)?;
             }
             SkillsAction::Install { path } => {
-                install::from_local(&path)?;
+                registry::from_local(&path)?;
             }
         },
 
@@ -335,81 +220,10 @@ fn dispatch_command(
         Commands::Config => {
             config::setup()?;
         }
-    }
 
-    Ok(())
-}
-
-/// Run a single recipe by name (used for dependency execution).
-fn run_recipe(
-    name: &str,
-    cli_input: &[String],
-    cli_output_dir: Option<&str>,
-    cli_model: Option<&str>,
-    cli_prompt: Option<&str>,
-    no_stream: bool,
-    extra_skills_dirs: &[String],
-    global_config: &config::Config,
-    api_client: &dyn runner::ApiClient,
-) -> Result<()> {
-    let r = recipe::get(name)?;
-
-    // Resolve skill dependencies
-    if !r.skill_deps.is_empty() {
-        recipe::resolve_skill_deps(&r.skill_deps, extra_skills_dirs)?;
-    }
-
-    let task_prompt = if let Some(p) = cli_prompt {
-        p.to_string()
-    } else if let Some(ref pf) = r.prompt_file {
-        fs::read_to_string(pf).with_context(|| format!("read prompt file: {pf}"))?
-    } else if let Some(ref p) = r.prompt {
-        p.clone()
-    } else {
-        anyhow::bail!("recipe {name:?} has no prompt or prompt_file");
-    };
-
-    let final_input = if !cli_input.is_empty() {
-        cli_input.to_vec()
-    } else {
-        r.input.clone()
-    };
-    let final_output_dir = cli_output_dir
-        .map(|s| s.to_string())
-        .or(r.output_dir.clone());
-    let resolved_model = cli_model
-        .map(|s| s.to_string())
-        .or(r.model.clone())
-        .or(global_config.model.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
-
-    let use_stream = if no_stream {
-        false
-    } else {
-        global_config.stream.unwrap_or(true)
-    };
-
-    let allow_bash = r.allow_bash
-        .or(global_config.allow_bash)
-        .unwrap_or(false);
-
-    let skills = skill::discover(extra_skills_dirs).context("discover skills")?;
-    let ws = workspace::Workspace::new()?;
-    if !final_input.is_empty() {
-        ws.stage_inputs(&final_input)?;
-    }
-
-    runner::run_with_client(&runner::Config {
-        model: resolved_model,
-        prompt: task_prompt,
-        skills,
-        work_dir: ws.dir.to_string_lossy().to_string(),
-        stream: use_stream,
-        allow_bash,
-    }, api_client)?;
-
-    if let Some(ref out) = final_output_dir {
-        ws.collect_outputs(out)?;
+        Commands::Version => {
+            println!("taskpilot {}", env!("CARGO_PKG_VERSION"));
+        }
     }
 
     Ok(())
@@ -468,318 +282,11 @@ mod tests {
         assert_eq!(truncate_desc("12345", 5), "12345");
     }
 
-    // ── MockApiClient for main.rs tests ──────────────────────────
+    // ── MockApiClient for dispatch_command tests ──────────────────
 
+    use crate::testutil::MockApiClient;
     use std::cell::RefCell;
     use std::collections::VecDeque;
-
-    struct MockApiClient {
-        responses: RefCell<VecDeque<anyhow::Result<(serde_json::Value, String)>>>,
-    }
-
-    impl MockApiClient {
-        fn immediate_end() -> Self {
-            Self {
-                responses: RefCell::new(VecDeque::from(vec![Ok((
-                    serde_json::json!([{"type": "text", "text": "done"}]),
-                    "end_turn".into(),
-                ))])),
-            }
-        }
-    }
-
-    impl runner::ApiClient for MockApiClient {
-        fn call(
-            &self,
-            _api_key: &str,
-            _body: &serde_json::Value,
-            _stream: bool,
-            _iteration: usize,
-        ) -> anyhow::Result<(serde_json::Value, String)> {
-            self.responses.borrow_mut().pop_front().unwrap()
-        }
-    }
-
-    // ── run_recipe tests ─────────────────────────────────────────
-
-    #[test]
-    #[serial]
-    fn run_recipe_with_prompt() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "do the thing"
-output_dir = "out/"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
-        assert!(result.is_ok());
-        assert!(canonical.join("out").exists());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_with_cli_prompt_override() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "original"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let result = run_recipe(
-            "test", &[], None, None, Some("override prompt"), true, &[], &cfg, &client,
-        );
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_with_prompt_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(canonical.join("my-prompt.md"), "file prompt").unwrap();
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt_file = "my-prompt.md"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_no_prompt_errors() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-output_dir = "out/"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
-        assert!(result.is_err());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_with_inputs_and_output() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(canonical.join("data.csv"), "a,b\n1,2").unwrap();
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "analyze"
-input = ["data.csv"]
-output_dir = "results/"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_with_cli_input_override() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(canonical.join("override.txt"), "data").unwrap();
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "go"
-input = ["original.csv"]
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let cli_input = vec![canonical.join("override.txt").to_string_lossy().to_string()];
-        let result = run_recipe("test", &cli_input, None, None, None, true, &[], &cfg, &client);
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_with_model_override() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "go"
-model = "recipe-model"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config { model: Some("config-model".into()), ..Default::default() };
-        // cli_model overrides recipe and config
-        let result = run_recipe("test", &[], None, Some("cli-model"), None, true, &[], &cfg, &client);
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_allow_bash_from_recipe() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "go"
-allow_bash = true
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let result = run_recipe("test", &[], None, None, None, false, &[], &cfg, &client);
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_stream_from_config() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "go"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config { stream: Some(false), ..Default::default() };
-        let result = run_recipe("test", &[], None, None, None, false, &[], &cfg, &client);
-        assert!(result.is_ok());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
-
-    #[test]
-    #[serial]
-    fn run_recipe_cli_output_dir_override() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let canonical = tmp.path().canonicalize().unwrap();
-        std::env::set_current_dir(&canonical).unwrap();
-        std::env::set_var("HOME", canonical.to_str().unwrap());
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-
-        std::fs::write(
-            canonical.join("taskpilot.toml"),
-            r#"
-[recipes.test]
-prompt = "go"
-output_dir = "original/"
-"#,
-        )
-        .unwrap();
-
-        let client = MockApiClient::immediate_end();
-        let cfg = config::Config::default();
-        let override_out = canonical.join("override-out");
-        let result = run_recipe(
-            "test", &[], Some(override_out.to_str().unwrap()), None, None, true, &[], &cfg, &client,
-        );
-        assert!(result.is_ok());
-        assert!(override_out.exists());
-
-        std::env::remove_var("ANTHROPIC_API_KEY");
-    }
 
     // ── dispatch_command tests ───────────────────────────────────
 
@@ -943,10 +450,10 @@ output_dir = "out/"
     #[serial]
     fn dispatch_run_recipe_with_deps_executes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir = setup_dispatch_env(&tmp);
+        let _dir = setup_dispatch_env(&tmp);
 
         std::fs::write(
-            dir.join("taskpilot.toml"),
+            tmp.path().canonicalize().unwrap().join("taskpilot.toml"),
             r#"
 [recipes.step1]
 prompt = "first"

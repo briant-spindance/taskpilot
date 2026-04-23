@@ -3,21 +3,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-pub struct Workspace {
+pub(crate) struct Workspace {
     _temp: TempDir,
-    pub dir: PathBuf,
+    pub(crate) dir: PathBuf,
 }
 
 impl Workspace {
     /// Create a new temporary workspace.
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let temp = TempDir::new().context("create temp dir")?;
         let dir = temp.path().to_path_buf();
         Ok(Workspace { _temp: temp, dir })
     }
 
     /// Copy input files into the workspace, preserving filenames.
-    pub fn stage_inputs(&self, inputs: &[String]) -> Result<()> {
+    pub(crate) fn stage_inputs(&self, inputs: &[String]) -> Result<()> {
         for src in inputs {
             let src_path = Path::new(src);
             let filename = src_path
@@ -31,7 +31,7 @@ impl Workspace {
     }
 
     /// Copy all files from the workspace to the output directory.
-    pub fn collect_outputs(&self, output_dir: &str) -> Result<()> {
+    pub(crate) fn collect_outputs(&self, output_dir: &str) -> Result<()> {
         let out = Path::new(output_dir);
         fs::create_dir_all(out).context("create output dir")?;
 

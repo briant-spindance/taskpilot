@@ -9,29 +9,28 @@ const CONFIG_DIR: &str = "taskpilot";
 const CONFIG_FILE: &str = "config.yml";
 
 #[derive(Debug, Deserialize, Default)]
-pub struct Config {
+pub(crate) struct Config {
     /// Anthropic API key (overridden by ANTHROPIC_API_KEY env var or project .env)
-    pub api_key: Option<String>,
+    pub(crate) api_key: Option<String>,
     /// Default model (overridden by --model flag or recipe model field)
-    pub model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Default streaming behavior (overridden by --no-stream flag)
-    pub stream: Option<bool>,
+    pub(crate) stream: Option<bool>,
     /// Whether bash tool is allowed by default (overridden by --allow-bash flag or recipe field)
-    pub allow_bash: Option<bool>,
+    pub(crate) allow_bash: Option<bool>,
 }
 
 /// Resolve the config file path: ~/.local/taskpilot/config.yml
 fn config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".local")
+    crate::constants::home_dir().ok().map(|home| {
+        home.join(".local")
             .join(CONFIG_DIR)
             .join(CONFIG_FILE)
     })
 }
 
 /// Load the global config file. Returns default config if the file doesn't exist.
-pub fn load() -> Config {
+pub(crate) fn load() -> Config {
     let path = match config_path() {
         Some(p) => p,
         None => return Config::default(),
@@ -59,19 +58,19 @@ pub fn load() -> Config {
 }
 
 /// Get the config file path (for display in doctor/help).
-pub fn path_display() -> String {
+pub(crate) fn path_display() -> String {
     config_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.local/taskpilot/config.yml".to_string())
 }
 
 /// Interactive setup: prompt for values and write config.yml.
-pub fn setup() -> Result<()> {
+pub(crate) fn setup() -> Result<()> {
     setup_with_reader(&mut io::stdin().lock())
 }
 
 /// Testable setup that reads interactive input from the provided reader.
-pub fn setup_with_reader(reader: &mut dyn BufRead) -> Result<()> {
+pub(crate) fn setup_with_reader(reader: &mut dyn BufRead) -> Result<()> {
     let path = config_path()
         .context("could not resolve home directory")?;
 
@@ -118,7 +117,7 @@ pub fn setup_with_reader(reader: &mut dyn BufRead) -> Result<()> {
     };
 
     // Model
-    let default_model = "claude-sonnet-4-20250514";
+    let default_model = crate::constants::DEFAULT_MODEL;
     print!("  Default model [{}]: ", default_model.dimmed());
     io::stdout().flush()?;
     let mut model_input = String::new();

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Return the Anthropic tool definitions, optionally including bash.
-pub fn tool_defs(allow_bash: bool) -> Vec<Value> {
+pub(crate) fn tool_defs(allow_bash: bool) -> Vec<Value> {
     let mut tools: Vec<Value> = Vec::new();
 
     if allow_bash {
@@ -51,7 +51,7 @@ pub fn tool_defs(allow_bash: bool) -> Vec<Value> {
 }
 
 /// Dispatch a tool call and return the text result.
-pub fn dispatch(tool_name: &str, input: &Value, work_dir: &Path, allow_bash: bool) -> Result<String> {
+pub(crate) fn dispatch(tool_name: &str, input: &Value, work_dir: &Path, allow_bash: bool) -> Result<String> {
     match tool_name {
         "bash" => {
             if !allow_bash {
