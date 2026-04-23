@@ -82,11 +82,6 @@ enum Commands {
     /// Set up global config (~/.local/taskpilot/config.yml)
     Config,
 
-    /// Install a skill from a local directory
-    Install {
-        /// Path to the skill directory
-        path: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +106,11 @@ enum SkillsAction {
         /// Install globally (~/.agents/skills/) instead of project-level
         #[arg(short, long)]
         global: bool,
+    },
+    /// Install a skill from a local directory
+    Install {
+        /// Path to the skill directory
+        path: String,
     },
 }
 
@@ -315,11 +315,10 @@ fn main() -> Result<()> {
             SkillsAction::Add { source, global } => {
                 registry::add(&source, global)?;
             }
+            SkillsAction::Install { path } => {
+                install::from_local(&path)?;
+            }
         },
-
-        Commands::Install { path } => {
-            install::from_local(&path)?;
-        }
 
         Commands::Init => {
             recipe::init()?;

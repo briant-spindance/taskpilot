@@ -19,6 +19,7 @@ struct RecipeFile {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Recipe {
+    pub description: Option<String>,
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     #[serde(default)]
@@ -82,6 +83,9 @@ pub fn list() -> Result<()> {
         };
 
         println!("  {} {}", "●".green(), name.bold());
+        if let Some(ref desc) = recipe.description {
+            println!("    {}", desc.dimmed());
+        }
 
         let mut details = Vec::new();
         if !recipe.input.is_empty() {
