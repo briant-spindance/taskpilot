@@ -223,11 +223,24 @@ User invokes CLI
 
 ## Configuration
 
+Configuration is loaded in precedence order (later overrides earlier):
+
+1. `~/.local/taskpilot/config.yml` — global user defaults (API key, model, streaming)
+2. `./.env` — project-level environment variables
+3. Environment variables — shell exports
+4. CLI flags — highest precedence
+
+### `src/config.rs`
+
+Loads and parses `~/.local/taskpilot/config.yml` using `serde_yaml`. Returns a `Config` struct with optional fields: `api_key`, `model`, `stream`. Falls back to defaults if the file is missing or malformed.
+
 | Source | Purpose |
 |--------|---------|
-| `ANTHROPIC_API_KEY` | Required. API authentication. |
+| `~/.local/taskpilot/config.yml` | Global defaults: API key, model, streaming behavior. |
+| `ANTHROPIC_API_KEY` | Required. API authentication (env var, .env, or config.yml). |
 | `TASKPILOT_SKILLS_DIR` | Optional. Override user-level skills directory. |
-| `.env` file | Optional. Loaded automatically for API key and other env vars. |
+| `.env` file | Optional. Project-level environment variables. |
 | `taskpilot.toml` | Optional. Defines named recipes with prompts, inputs, outputs, and skill deps. |
 | `--model` flag | Optional. Select Anthropic model (default: `claude-sonnet-4-20250514`). |
 | `--no-stream` flag | Optional. Disable streaming output (wait for full response). |
+| `--skills-dir` flag | Optional. Additional skills directories to search (repeatable). |

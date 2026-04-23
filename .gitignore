@@ -1,3 +1,5 @@
 /target
 .env
 test/output/
+test/staging/
+.agents/

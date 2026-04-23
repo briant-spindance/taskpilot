@@ -1,3 +1,4 @@
+mod config;
 mod install;
 mod recipe;
 mod registry;
@@ -74,6 +75,9 @@ enum Commands {
     /// Initialize a new taskpilot.toml with an example recipe
     Init,
 
+    /// Set up global config (~/.local/taskpilot/config.yml)
+    Config,
+
     /// Install a skill from a local directory
     Install {
         /// Path to the skill directory
@@ -107,8 +111,18 @@ enum SkillsAction {
 }
 
 fn main() -> Result<()> {
-    // Load .env file if present (silently ignore if missing)
+    // Load project-level .env if present
     let _ = dotenvy::dotenv();
+
+    // Load global config from ~/.local/taskpilot/config.yml
+    let global_config = config::load();
+
+    // If ANTHROPIC_API_KEY is not set via env/.env, use config.yml value
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        if let Some(ref key) = global_config.api_key {
+            std::env::set_var("ANTHROPIC_API_KEY", key);
+        }
+    }
 
     let cli = Cli::parse();
 
@@ -139,7 +153,7 @@ fn main() -> Result<()> {
                         );
                         for dep_name in deps {
                             eprintln!("\n{} {}", "▶ dependency:".cyan().bold(), dep_name.bold());
-                            run_recipe(dep_name, &[], None, None, None, no_stream, &skills_dir)?;
+                            run_recipe(dep_name, &[], None, None, None, no_stream, &skills_dir, &global_config)?;
                         }
                         eprintln!("\n{} {}", "▶ target:".green().bold(), name.bold());
                     }
@@ -187,7 +201,15 @@ fn main() -> Result<()> {
                     (p, input, output_dir, model)
                 };
 
-            let resolved_model = final_model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            let resolved_model = final_model
+                .or(global_config.model.clone())
+                .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
+            let use_stream = if no_stream {
+                false
+            } else {
+                global_config.stream.unwrap_or(true)
+            };
 
             // Discover skills
             let skills = skill::discover(&skills_dir).context("discover skills")?;
@@ -222,7 +244,7 @@ fn main() -> Result<()> {
                 prompt: task_prompt,
                 skills,
                 work_dir: ws.dir.to_string_lossy().to_string(),
-                stream: !no_stream,
+                stream: use_stream,
             })?;
 
             // Collect outputs
@@ -286,6 +308,10 @@ fn main() -> Result<()> {
         Commands::Init => {
             recipe::init()?;
         }
+
+        Commands::Config => {
+            config::setup()?;
+        }
     }
 
     Ok(())
@@ -300,6 +326,7 @@ fn run_recipe(
     cli_prompt: Option<&str>,
     no_stream: bool,
     extra_skills_dirs: &[String],
+    global_config: &config::Config,
 ) -> Result<()> {
     let r = recipe::get(name)?;
 
@@ -329,7 +356,14 @@ fn run_recipe(
     let resolved_model = cli_model
         .map(|s| s.to_string())
         .or(r.model.clone())
+        .or(global_config.model.clone())
         .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
+    let use_stream = if no_stream {
+        false
+    } else {
+        global_config.stream.unwrap_or(true)
+    };
 
     let skills = skill::discover(extra_skills_dirs).context("discover skills")?;
     let ws = workspace::Workspace::new()?;
@@ -342,7 +376,7 @@ fn run_recipe(
         prompt: task_prompt,
         skills,
         work_dir: ws.dir.to_string_lossy().to_string(),
-        stream: !no_stream,
+        stream: use_stream,
     })?;
 
     if let Some(ref out) = final_output_dir {

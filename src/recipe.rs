@@ -151,7 +151,16 @@ pub fn doctor() -> Result<()> {
     println!("{}", "taskpilot doctor".bold());
     println!();
 
-    // 1. Check .env / ANTHROPIC_API_KEY
+    // 1. Check config.yml
+    let config_path = crate::config::path_display();
+    print!("  config.yml         ");
+    if std::path::Path::new(&config_path).exists() {
+        println!("{}", "✓ found".green());
+    } else {
+        println!("{}", format!("- not found ({config_path})").dimmed());
+    }
+
+    // 2. Check ANTHROPIC_API_KEY
     print!("  ANTHROPIC_API_KEY  ");
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
         println!("{}", "✓ set".green());
