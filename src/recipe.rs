@@ -3,7 +3,7 @@ use colored::Colorize;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use crate::registry;
@@ -312,7 +312,7 @@ pub fn doctor() -> Result<()> {
     Ok(())
 }
 
-fn print_summary(errors: u32, warnings: u32) {
+pub(crate) fn print_summary(errors: u32, warnings: u32) {
     if errors == 0 && warnings == 0 {
         println!("{}", "All checks passed.".green().bold());
     } else {
@@ -380,6 +380,17 @@ pub fn resolve_depends_on(target: &str) -> Result<Vec<String>> {
 /// Check and resolve skill dependencies for a recipe.
 /// Local deps (bare names) are verified. Remote deps (with /) are auto-installed if missing.
 pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    resolve_skill_deps_with_reader(deps, extra_dirs, &mut reader)
+}
+
+/// Inner implementation that accepts an arbitrary reader for testability.
+pub fn resolve_skill_deps_with_reader(
+    deps: &[String],
+    extra_dirs: &[String],
+    reader: &mut dyn BufRead,
+) -> Result<()> {
     if deps.is_empty() {
         return Ok(());
     }
@@ -389,7 +400,6 @@ pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> 
     for dep in deps {
         let is_remote = dep.contains('/');
         let skill_name = if is_remote {
-            // Last segment is the skill name
             dep.rsplit('/').next().unwrap_or(dep)
         } else {
             dep.as_str()
@@ -407,7 +417,6 @@ pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> 
         }
 
         if is_remote {
-            // Ask user where to install
             eprintln!(
                 "\n  {} skill {} is required but not installed.",
                 "!".yellow().bold(),
@@ -423,7 +432,7 @@ pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> 
             io::stderr().flush()?;
 
             let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
+            reader.read_line(&mut input)?;
             let choice = input.trim().to_lowercase();
 
             match choice.as_str() {
@@ -438,7 +447,6 @@ pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> 
                 }
             }
         } else {
-            // Local-only dep, can't auto-install
             bail!(
                 "recipe requires skill {skill_name:?} which is not installed.\n  \
                  Search: taskpilot skills find {skill_name}\n  \
@@ -448,4 +456,707 @@ pub fn resolve_skill_deps(deps: &[String], extra_dirs: &[String]) -> Result<()> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// Helper: create a TempDir, write a taskpilot.toml with the given content,
+    /// and chdir into it. Returns the TempDir (must be kept alive).
+    fn setup_toml(content: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("taskpilot.toml"), content).unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        dir
+    }
+
+    /// Helper: chdir to a fresh empty TempDir.
+    fn setup_empty() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        dir
+    }
+
+    // ---- load ----
+
+    #[test]
+    #[serial]
+    fn load_no_file() {
+        let _dir = setup_empty();
+        let err = load().unwrap_err();
+        assert!(err.to_string().contains("no taskpilot.toml"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_valid_toml() {
+        let _dir = setup_toml(
+            r#"
+[recipes.foo]
+prompt = "do stuff"
+"#,
+        );
+        let recipes = load().unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert!(recipes.contains_key("foo"));
+        assert_eq!(recipes["foo"].prompt.as_deref(), Some("do stuff"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_invalid_toml() {
+        let _dir = setup_toml("this is not valid toml [[[");
+        let err = load().unwrap_err();
+        assert!(err.to_string().contains("parse taskpilot.toml"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_empty_recipes() {
+        let _dir = setup_toml("[recipes]\n");
+        let recipes = load().unwrap();
+        assert!(recipes.is_empty());
+    }
+
+    // ---- get ----
+
+    #[test]
+    #[serial]
+    fn get_exists() {
+        let _dir = setup_toml(
+            r#"
+[recipes.alpha]
+prompt = "hello"
+"#,
+        );
+        let r = get("alpha").unwrap();
+        assert_eq!(r.prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    #[serial]
+    fn get_not_found_with_available() {
+        let _dir = setup_toml(
+            r#"
+[recipes.alpha]
+prompt = "hello"
+"#,
+        );
+        let err = get("missing").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing"));
+        assert!(msg.contains("alpha"));
+    }
+
+    #[test]
+    #[serial]
+    fn get_not_found_none_available() {
+        let _dir = setup_toml("[recipes]\n");
+        let err = get("anything").unwrap_err();
+        assert!(err.to_string().contains("(none)"));
+    }
+
+    // ---- list ----
+
+    #[test]
+    #[serial]
+    fn list_empty() {
+        let _dir = setup_toml("[recipes]\n");
+        list().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn list_with_prompt() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "short prompt"
+"#,
+        );
+        list().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn list_with_prompt_file() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt_file = "my_prompt.md"
+"#,
+        );
+        list().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn list_no_prompt() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+description = "desc"
+"#,
+        );
+        list().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn list_long_prompt_truncated() {
+        let long = "a".repeat(100);
+        let _dir = setup_toml(&format!(
+            r#"
+[recipes.a]
+prompt = "{long}"
+"#,
+        ));
+        list().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn list_with_details() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "do it"
+input = ["file1.txt", "file2.txt"]
+output_dir = "out/"
+skill_deps = ["some-skill"]
+description = "a recipe"
+"#,
+        );
+        list().unwrap();
+    }
+
+    // ---- init ----
+
+    #[test]
+    #[serial]
+    fn init_creates_file() {
+        let _dir = setup_empty();
+        init().unwrap();
+        assert!(Path::new("taskpilot.toml").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn init_already_exists() {
+        let _dir = setup_toml("[recipes]\n");
+        let err = init().unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    // ---- doctor ----
+
+    #[test]
+    #[serial]
+    fn doctor_happy_path() {
+        let dir = TempDir::new().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("input.txt"), "data").unwrap();
+        fs::write(dir.path().join("prompt.md"), "do stuff").unwrap();
+        fs::write(
+            dir.path().join("taskpilot.toml"),
+            r#"
+[recipes.r1]
+prompt_file = "prompt.md"
+input = ["input.txt"]
+output_dir = "out/"
+"#,
+        )
+        .unwrap();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_no_toml() {
+        let _dir = setup_empty();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_invalid_toml() {
+        let _dir = setup_toml("not valid [[[");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_no_recipes() {
+        let _dir = setup_toml("[recipes]\n");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_no_prompt_or_prompt_file() {
+        let _dir = setup_toml(
+            r#"
+[recipes.bad]
+input = []
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_prompt_file_missing() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt_file = "nonexistent.md"
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_inline_prompt() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "do it"
+output_dir = "out/"
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_input_missing() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+input = ["nope.txt"]
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_input_exists() {
+        let dir = TempDir::new().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("data.txt"), "").unwrap();
+        fs::write(
+            dir.path().join("taskpilot.toml"),
+            r#"
+[recipes.r]
+prompt = "go"
+input = ["data.txt"]
+output_dir = "out/"
+"#,
+        )
+        .unwrap();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_no_output_dir_warning() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_skill_dep_local_not_installed() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+output_dir = "out/"
+skill_deps = ["nonexistent-skill"]
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_skill_dep_remote_not_installed() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+output_dir = "out/"
+skill_deps = ["owner/repo/remote-skill"]
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_depends_on_valid() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "go"
+output_dir = "out/"
+
+[recipes.b]
+prompt = "then"
+output_dir = "out/"
+depends_on = ["a"]
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_depends_on_invalid() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "go"
+output_dir = "out/"
+depends_on = ["nonexistent"]
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_circular_dependency() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "go"
+output_dir = "out/"
+depends_on = ["b"]
+
+[recipes.b]
+prompt = "go"
+output_dir = "out/"
+depends_on = ["a"]
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_allow_bash_true() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+output_dir = "out/"
+allow_bash = true
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_allow_bash_false() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+output_dir = "out/"
+allow_bash = false
+"#,
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_no_api_key() {
+        let _dir = setup_toml(
+            r#"
+[recipes.r]
+prompt = "go"
+output_dir = "out/"
+"#,
+        );
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        doctor().unwrap();
+    }
+
+    // ---- resolve_depends_on ----
+
+    #[test]
+    #[serial]
+    fn resolve_single_no_deps() {
+        let _dir = setup_toml(
+            r#"
+[recipes.solo]
+prompt = "go"
+"#,
+        );
+        let order = resolve_depends_on("solo").unwrap();
+        assert_eq!(order, vec!["solo"]);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_linear_chain() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "1"
+
+[recipes.b]
+prompt = "2"
+depends_on = ["a"]
+
+[recipes.c]
+prompt = "3"
+depends_on = ["b"]
+"#,
+        );
+        let order = resolve_depends_on("c").unwrap();
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_target_not_found() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "1"
+"#,
+        );
+        let err = resolve_depends_on("missing").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_dep_references_nonexistent() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "1"
+depends_on = ["ghost"]
+"#,
+        );
+        let err = resolve_depends_on("a").unwrap_err();
+        assert!(err.to_string().contains("ghost"));
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_circular() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "1"
+depends_on = ["b"]
+
+[recipes.b]
+prompt = "2"
+depends_on = ["a"]
+"#,
+        );
+        let err = resolve_depends_on("a").unwrap_err();
+        assert!(err.to_string().contains("circular"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_shared_dependency() {
+        let _dir = setup_toml(
+            r#"
+[recipes.a]
+prompt = "1"
+
+[recipes.b]
+prompt = "2"
+depends_on = ["a"]
+
+[recipes.c]
+prompt = "3"
+depends_on = ["a", "b"]
+"#,
+        );
+        let order = resolve_depends_on("c").unwrap();
+        assert_eq!(order.iter().filter(|x| *x == "a").count(), 1);
+        assert!(order.iter().position(|x| x == "a") < order.iter().position(|x| x == "b"));
+        assert!(order.iter().position(|x| x == "b") < order.iter().position(|x| x == "c"));
+    }
+
+    // ---- resolve_skill_deps_with_reader ----
+
+    #[test]
+    #[serial]
+    fn skill_deps_empty() {
+        let _dir = setup_empty();
+        let mut reader = io::Cursor::new(b"");
+        resolve_skill_deps_with_reader(&[], &[], &mut reader).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn skill_deps_local_not_installed() {
+        let _dir = setup_empty();
+        let mut reader = io::Cursor::new(b"");
+        let err =
+            resolve_skill_deps_with_reader(&["nonexistent".to_string()], &[], &mut reader)
+                .unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
+        assert!(err.to_string().contains("not installed"));
+    }
+
+    #[test]
+    #[serial]
+    fn skill_deps_remote_cancel() {
+        let _dir = setup_empty();
+        let mut reader = io::Cursor::new(b"c\n");
+        let err = resolve_skill_deps_with_reader(
+            &["owner/repo/myskill".to_string()],
+            &[],
+            &mut reader,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("installation cancelled"));
+    }
+
+    #[test]
+    #[serial]
+    fn skill_deps_remote_unknown_input_cancels() {
+        let _dir = setup_empty();
+        let mut reader = io::Cursor::new(b"x\n");
+        let err = resolve_skill_deps_with_reader(
+            &["owner/repo/myskill".to_string()],
+            &[],
+            &mut reader,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("installation cancelled"));
+    }
+
+    // ---- print_summary ----
+
+    #[test]
+    fn print_summary_no_issues() {
+        print_summary(0, 0);
+    }
+
+    #[test]
+    fn print_summary_errors_only() {
+        print_summary(3, 0);
+    }
+
+    #[test]
+    fn print_summary_warnings_only() {
+        print_summary(0, 2);
+    }
+
+    #[test]
+    fn print_summary_both() {
+        print_summary(1, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn skill_deps_local_installed() {
+        let dir = setup_empty();
+        // Create a skill that can be discovered
+        let skill_dir = dir.path().join(".agents").join("skills").join("myskill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# My Skill").unwrap();
+        let mut reader = io::Cursor::new(b"");
+        let result =
+            resolve_skill_deps_with_reader(&["myskill".to_string()], &[], &mut reader);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn skill_deps_remote_installed() {
+        let dir = setup_empty();
+        // Create a skill that matches the remote dep name
+        let skill_dir = dir.path().join(".agents").join("skills").join("myskill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# My Skill").unwrap();
+        let mut reader = io::Cursor::new(b"");
+        let result = resolve_skill_deps_with_reader(
+            &["owner/repo/myskill".to_string()],
+            &[],
+            &mut reader,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_skill_dep_installed() {
+        let dir = setup_empty();
+        // Create a skill and a recipe that depends on it
+        let skill_dir = dir.path().join(".agents").join("skills").join("myskill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# My Skill").unwrap();
+        std::fs::write(
+            dir.path().join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+skill_deps = ["myskill"]
+"#,
+        )
+        .unwrap();
+        std::env::set_var("ANTHROPIC_API_KEY", "test");
+        doctor().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
 }

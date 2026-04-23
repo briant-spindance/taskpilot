@@ -129,8 +129,16 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    dispatch_command(cli.command, &global_config, &runner::DefaultApiClient)
+}
 
-    match cli.command {
+/// Core command dispatch, parameterized on API client for testability.
+fn dispatch_command(
+    command: Commands,
+    global_config: &config::Config,
+    api_client: &dyn runner::ApiClient,
+) -> Result<()> {
+    match command {
         Commands::Run {
             recipe: recipe_name,
             prompt,
@@ -158,7 +166,7 @@ fn main() -> Result<()> {
                         );
                         for dep_name in deps {
                             eprintln!("\n{} {}", "▶ dependency:".cyan().bold(), dep_name.bold());
-                            run_recipe(dep_name, &[], None, None, None, no_stream, &skills_dir, &global_config)?;
+                            run_recipe(dep_name, &[], None, None, None, no_stream, &skills_dir, &global_config, api_client)?;
                         }
                         eprintln!("\n{} {}", "▶ target:".green().bold(), name.bold());
                     }
@@ -254,14 +262,14 @@ fn main() -> Result<()> {
             }
 
             // Run agentic loop
-            runner::run(&runner::Config {
+            runner::run_with_client(&runner::Config {
                 model: resolved_model,
                 prompt: task_prompt,
                 skills,
                 work_dir: ws.dir.to_string_lossy().to_string(),
                 stream: use_stream,
                 allow_bash,
-            })?;
+            }, api_client)?;
 
             // Collect outputs
             if let Some(ref out) = final_output_dir {
@@ -342,6 +350,7 @@ fn run_recipe(
     no_stream: bool,
     extra_skills_dirs: &[String],
     global_config: &config::Config,
+    api_client: &dyn runner::ApiClient,
 ) -> Result<()> {
     let r = recipe::get(name)?;
 
@@ -390,14 +399,14 @@ fn run_recipe(
         ws.stage_inputs(&final_input)?;
     }
 
-    runner::run(&runner::Config {
+    runner::run_with_client(&runner::Config {
         model: resolved_model,
         prompt: task_prompt,
         skills,
         work_dir: ws.dir.to_string_lossy().to_string(),
         stream: use_stream,
         allow_bash,
-    })?;
+    }, api_client)?;
 
     if let Some(ref out) = final_output_dir {
         ws.collect_outputs(out)?;
@@ -415,5 +424,656 @@ fn truncate_desc(s: &str, max: usize) -> String {
         first_sentence
     } else {
         format!("{}...", &first_sentence[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn truncate_desc_first_sentence_fits() {
+        assert_eq!(
+            truncate_desc("Hello world. More text here", 20),
+            "Hello world."
+        );
+    }
+
+    #[test]
+    fn truncate_desc_first_sentence_exceeds_max() {
+        assert_eq!(
+            truncate_desc("This is a long first sentence. And more.", 10),
+            "This is a ..."
+        );
+    }
+
+    #[test]
+    fn truncate_desc_no_separator_fits() {
+        assert_eq!(truncate_desc("Short text", 20), "Short text");
+    }
+
+    #[test]
+    fn truncate_desc_no_separator_exceeds_max() {
+        assert_eq!(truncate_desc("A longer string here", 7), "A longe...");
+    }
+
+    #[test]
+    fn truncate_desc_empty_string() {
+        assert_eq!(truncate_desc("", 10), "");
+    }
+
+    #[test]
+    fn truncate_desc_exactly_at_max() {
+        assert_eq!(truncate_desc("12345", 5), "12345");
+    }
+
+    // ── MockApiClient for main.rs tests ──────────────────────────
+
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    struct MockApiClient {
+        responses: RefCell<VecDeque<anyhow::Result<(serde_json::Value, String)>>>,
+    }
+
+    impl MockApiClient {
+        fn immediate_end() -> Self {
+            Self {
+                responses: RefCell::new(VecDeque::from(vec![Ok((
+                    serde_json::json!([{"type": "text", "text": "done"}]),
+                    "end_turn".into(),
+                ))])),
+            }
+        }
+    }
+
+    impl runner::ApiClient for MockApiClient {
+        fn call(
+            &self,
+            _api_key: &str,
+            _body: &serde_json::Value,
+            _stream: bool,
+            _iteration: usize,
+        ) -> anyhow::Result<(serde_json::Value, String)> {
+            self.responses.borrow_mut().pop_front().unwrap()
+        }
+    }
+
+    // ── run_recipe tests ─────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn run_recipe_with_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "do the thing"
+output_dir = "out/"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
+        assert!(result.is_ok());
+        assert!(canonical.join("out").exists());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_with_cli_prompt_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "original"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let result = run_recipe(
+            "test", &[], None, None, Some("override prompt"), true, &[], &cfg, &client,
+        );
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_with_prompt_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(canonical.join("my-prompt.md"), "file prompt").unwrap();
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt_file = "my-prompt.md"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_no_prompt_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+output_dir = "out/"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
+        assert!(result.is_err());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_with_inputs_and_output() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(canonical.join("data.csv"), "a,b\n1,2").unwrap();
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "analyze"
+input = ["data.csv"]
+output_dir = "results/"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let result = run_recipe("test", &[], None, None, None, true, &[], &cfg, &client);
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_with_cli_input_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(canonical.join("override.txt"), "data").unwrap();
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+input = ["original.csv"]
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let cli_input = vec![canonical.join("override.txt").to_string_lossy().to_string()];
+        let result = run_recipe("test", &cli_input, None, None, None, true, &[], &cfg, &client);
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_with_model_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+model = "recipe-model"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config { model: Some("config-model".into()), ..Default::default() };
+        // cli_model overrides recipe and config
+        let result = run_recipe("test", &[], None, Some("cli-model"), None, true, &[], &cfg, &client);
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_allow_bash_from_recipe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+allow_bash = true
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let result = run_recipe("test", &[], None, None, None, false, &[], &cfg, &client);
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_stream_from_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config { stream: Some(false), ..Default::default() };
+        let result = run_recipe("test", &[], None, None, None, false, &[], &cfg, &client);
+        assert!(result.is_ok());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn run_recipe_cli_output_dir_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+        std::fs::write(
+            canonical.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+output_dir = "original/"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+        let override_out = canonical.join("override-out");
+        let result = run_recipe(
+            "test", &[], Some(override_out.to_str().unwrap()), None, None, true, &[], &cfg, &client,
+        );
+        assert!(result.is_ok());
+        assert!(override_out.exists());
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    // ── dispatch_command tests ───────────────────────────────────
+
+    fn setup_dispatch_env(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        std::env::set_var("HOME", canonical.to_str().unwrap());
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        canonical
+    }
+
+    fn teardown_dispatch_env() {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_no_recipe_with_prompt_executes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+        std::fs::write(dir.join("input.txt"), "data").unwrap();
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: None,
+                prompt: Some("do it".into()),
+                prompt_file: None,
+                input: vec![dir.join("input.txt").to_string_lossy().to_string()],
+                output_dir: Some(dir.join("out").to_string_lossy().to_string()),
+                model: None,
+                dry_run: false,
+                no_stream: true,
+                skills_dir: vec![],
+                allow_bash: false,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        assert!(dir.join("out").exists());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_no_recipe_with_prompt_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+        std::fs::write(dir.join("p.txt"), "my prompt").unwrap();
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: None,
+                prompt: None,
+                prompt_file: Some("p.txt".into()),
+                input: vec![],
+                output_dir: None,
+                model: Some("test-model".into()),
+                dry_run: false,
+                no_stream: false,
+                skills_dir: vec![],
+                allow_bash: true,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_recipe_with_skill_deps_installed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+
+        // Create installed skill
+        let skill_dir = dir.join(".agents").join("skills").join("myskill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Skill").unwrap();
+
+        std::fs::write(
+            dir.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+skill_deps = ["myskill"]
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: Some("test".into()),
+                prompt: None,
+                prompt_file: None,
+                input: vec![],
+                output_dir: None,
+                model: None,
+                dry_run: false,
+                no_stream: true,
+                skills_dir: vec![],
+                allow_bash: false,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_recipe_with_input_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+
+        std::fs::write(dir.join("override.txt"), "override data").unwrap();
+        std::fs::write(
+            dir.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+input = ["missing.csv"]
+output_dir = "out/"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: Some("test".into()),
+                prompt: None,
+                prompt_file: None,
+                input: vec![dir.join("override.txt").to_string_lossy().to_string()],
+                output_dir: Some(dir.join("result").to_string_lossy().to_string()),
+                model: None,
+                dry_run: false,
+                no_stream: true,
+                skills_dir: vec![],
+                allow_bash: false,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_recipe_with_deps_executes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+
+        std::fs::write(
+            dir.join("taskpilot.toml"),
+            r#"
+[recipes.step1]
+prompt = "first"
+
+[recipes.step2]
+prompt = "second"
+depends_on = ["step1"]
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient {
+            responses: RefCell::new(VecDeque::from(vec![
+                Ok((serde_json::json!([{"type":"text","text":"ok"}]), "end_turn".into())),
+                Ok((serde_json::json!([{"type":"text","text":"ok"}]), "end_turn".into())),
+            ])),
+        };
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: Some("step2".into()),
+                prompt: None,
+                prompt_file: None,
+                input: vec![],
+                output_dir: None,
+                model: None,
+                dry_run: false,
+                no_stream: true,
+                skills_dir: vec![],
+                allow_bash: false,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_recipe_allow_bash_from_cli() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+
+        std::fs::write(
+            dir.join("taskpilot.toml"),
+            r#"
+[recipes.test]
+prompt = "go"
+"#,
+        )
+        .unwrap();
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: Some("test".into()),
+                prompt: None,
+                prompt_file: None,
+                input: vec![],
+                output_dir: None,
+                model: None,
+                dry_run: false,
+                no_stream: true,
+                skills_dir: vec![],
+                allow_bash: true,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_skills_list_multiple() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = setup_dispatch_env(&tmp);
+
+        // Create two skills
+        for name in &["skill-a", "skill-b"] {
+            let sd = dir.join(".agents").join("skills").join(name);
+            std::fs::create_dir_all(&sd).unwrap();
+            std::fs::write(sd.join("SKILL.md"), format!("---\nname: {name}\ndescription: Desc for {name}\n---\n")).unwrap();
+        }
+
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Skills { action: SkillsAction::List },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_ok());
+        teardown_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_run_no_prompt_no_prompt_file_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_dispatch_env(&tmp);
+        let client = MockApiClient::immediate_end();
+        let cfg = config::Config::default();
+
+        let result = dispatch_command(
+            Commands::Run {
+                recipe: None,
+                prompt: None,
+                prompt_file: None,
+                input: vec![],
+                output_dir: None,
+                model: None,
+                dry_run: false,
+                no_stream: true,
+                skills_dir: vec![],
+                allow_bash: false,
+            },
+            &cfg,
+            &client,
+        );
+        assert!(result.is_err());
+        teardown_dispatch_env();
     }
 }
