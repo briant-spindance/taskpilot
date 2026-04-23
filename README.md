@@ -63,6 +63,7 @@ This example defines a three-stage data pipeline. Each recipe is a self-containe
 
 ```toml
 [recipes.clean-data]
+description = "Remove incomplete rows from raw CSV data"
 prompt = """
 Read input.csv, remove rows with missing values,
 and write cleaned.csv
@@ -72,6 +73,7 @@ output_dir = "staging/"
 allow_bash = true
 
 [recipes.generate-report]
+description = "Analyze cleaned data and produce a summary report"
 prompt = """
 Analyze cleaned.csv and produce a summary report
 in report.md with key metrics and insights
@@ -84,6 +86,7 @@ skill_deps = ["markdown-report"]
 depends_on = ["clean-data"]
 
 [recipes.executive-summary]
+description = "Condense the full report into an executive summary"
 prompt_file = "prompts/exec-summary.md"
 input = ["output/"]
 output_dir = "output/"
@@ -120,6 +123,7 @@ You can also run any recipe in the chain directly. Running `taskpilot run genera
 
 | Field | Description |
 |-------|-------------|
+| `description` | Short human-readable summary shown by `taskpilot recipes`. |
 | `prompt` | Inline task prompt. Supports TOML multi-line strings (`"""`). |
 | `prompt_file` | Path to a file containing the prompt. Use this for longer or shared prompts. |
 | `input` | Array of files or directories staged into the workspace before the task runs. |

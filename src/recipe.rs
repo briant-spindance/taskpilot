@@ -123,6 +123,7 @@ pub fn init() -> Result<()> {
 # run first in topological order. Circular dependencies are rejected.
 
 [recipes.prepare-data]
+description = "Remove incomplete rows from raw CSV data"
 prompt = """
 Read input.csv, clean missing values,
 and write cleaned.csv
@@ -131,6 +132,7 @@ input = ["data/input.csv"]
 output_dir = "staging/"
 
 [recipes.generate-report]
+description = "Analyze cleaned data and produce a summary report"
 prompt = """
 Analyze cleaned.csv and produce a summary report
 in report.md with key metrics and insights
