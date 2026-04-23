@@ -785,6 +785,213 @@ mod tests {
         assert!(existing.join("SKILL.md").exists());
     }
 
+    #[test]
+    fn resolve_skill_path_fuzzy_dirname_ends_with_name() {
+        // Matcher: dir_name.ends_with(name) — e.g. searching for "pdf" matches "awesome-pdf"
+        let skills_listing = serde_json::json!([
+            {"name": "awesome-pdf", "path": "skills/awesome-pdf", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false), // skills/pdf
+            MockResponse::Exists(false), // pdf
+            MockResponse::Json(skills_listing), // list skills/
+        ]);
+        let (path, name) = resolve_skill_path(&mock, "o", "r", Some("pdf")).unwrap();
+        assert_eq!(path, "skills/awesome-pdf");
+        assert_eq!(name, "awesome-pdf");
+    }
+
+    #[test]
+    fn resolve_skill_path_fuzzy_contains_match() {
+        // Matcher: name.contains(dir_name) && dir_name.len() > 3
+        // All higher-priority matchers must miss first.
+        // name = "my-excel-tool", dir = "excel" (len 5 > 3)
+        // exact: "excel" != "my-excel-tool"
+        // name.ends_with(dir): "my-excel-tool".ends_with("excel") = false
+        // dir.ends_with(name): "excel".ends_with("my-excel-tool") = false
+        // name.contains(dir): "my-excel-tool".contains("excel") = true ✓
+        let skills_listing = serde_json::json!([
+            {"name": "excel", "path": "skills/excel", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),
+            MockResponse::Exists(false),
+            MockResponse::Json(skills_listing),
+        ]);
+        let (path, name) = resolve_skill_path(&mock, "o", "r", Some("my-excel-tool")).unwrap();
+        assert_eq!(path, "skills/excel");
+        assert_eq!(name, "excel");
+    }
+
+    #[test]
+    fn resolve_skill_path_fuzzy_empty_parent() {
+        // Falls through skills (error) and plugins (error), then matches in root listing
+        let root_listing = serde_json::json!([
+            {"name": "my-skill", "path": "my-skill", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),        // skills/my-skill
+            MockResponse::Exists(false),        // my-skill (exact path check)
+            MockResponse::Err("404".into()),    // list skills/
+            MockResponse::Err("404".into()),    // list plugins/
+            MockResponse::Json(root_listing),   // list root
+        ]);
+        let (path, name) = resolve_skill_path(&mock, "o", "r", Some("my-skill")).unwrap();
+        // empty parent → path is just the dir name
+        assert_eq!(path, "my-skill");
+        assert_eq!(name, "my-skill");
+    }
+
+    #[test]
+    fn resolve_skill_path_deep_search_exact() {
+        // Deep search: plugins/<top>/skills/<skill> — exact name match
+        let plugins_listing = serde_json::json!([
+            {"name": "provider", "path": "plugins/provider", "type": "dir", "download_url": null}
+        ]);
+        let skills_listing = serde_json::json!([
+            {"name": "deepskill", "path": "plugins/provider/skills/deepskill", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),        // skills/deepskill
+            MockResponse::Exists(false),        // deepskill
+            MockResponse::Err("404".into()),    // list skills/
+            MockResponse::Err("404".into()),    // list plugins/
+            MockResponse::Err("404".into()),    // list root
+            MockResponse::Json(plugins_listing), // deep: list plugins/
+            MockResponse::Json(skills_listing),  // deep: list plugins/provider/skills
+        ]);
+        let (path, name) = resolve_skill_path(&mock, "o", "r", Some("deepskill")).unwrap();
+        assert_eq!(path, "plugins/provider/skills/deepskill");
+        assert_eq!(name, "deepskill");
+    }
+
+    #[test]
+    fn resolve_skill_path_deep_search_name_ends_with() {
+        // Deep search: name.ends_with(&d.name) branch (line 270)
+        let plugins_listing = serde_json::json!([
+            {"name": "vendor", "path": "plugins/vendor", "type": "dir", "download_url": null}
+        ]);
+        let skills_listing = serde_json::json!([
+            {"name": "cool-thing", "path": "plugins/vendor/skills/cool-thing", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),
+            MockResponse::Exists(false),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Json(plugins_listing),
+            MockResponse::Json(skills_listing),
+        ]);
+        // name = "prefix-cool-thing", d.name = "cool-thing" → name.ends_with(d.name) = true
+        let (path, name) = resolve_skill_path(&mock, "o", "r", Some("prefix-cool-thing")).unwrap();
+        assert_eq!(path, "plugins/vendor/skills/cool-thing");
+        assert_eq!(name, "cool-thing");
+    }
+
+    #[test]
+    fn resolve_skill_path_deep_search_dir_ends_with_name() {
+        // Deep search: d.name.ends_with(name) branch (line 271)
+        let plugins_listing = serde_json::json!([
+            {"name": "vendor", "path": "plugins/vendor", "type": "dir", "download_url": null}
+        ]);
+        let skills_listing = serde_json::json!([
+            {"name": "super-abc", "path": "plugins/vendor/skills/super-abc", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),
+            MockResponse::Exists(false),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Json(plugins_listing),
+            MockResponse::Json(skills_listing),
+        ]);
+        // name = "abc", d.name = "super-abc" → d.name.ends_with(name) = true
+        let (path, name) = resolve_skill_path(&mock, "o", "r", Some("abc")).unwrap();
+        assert_eq!(path, "plugins/vendor/skills/super-abc");
+        assert_eq!(name, "super-abc");
+    }
+
+    #[test]
+    fn resolve_skill_path_fuzzy_contains_short_name_skipped() {
+        // dir_name.len() <= 3 should NOT match via contains matcher, falling through to deep search
+        // This covers the dir_name.len() > 3 == false branch on line 242
+        let skills_listing = serde_json::json!([
+            {"name": "ab", "path": "skills/ab", "type": "dir", "download_url": null}
+        ]);
+        let plugins_listing_fuzzy = serde_json::json!([]);
+        let root_listing = serde_json::json!([]);
+        // Deep search plugins listing
+        let plugins_deep = serde_json::json!([]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),           // skills/xaby
+            MockResponse::Exists(false),           // xaby
+            MockResponse::Json(skills_listing),    // list skills/ — "ab" is too short for contains
+            MockResponse::Json(plugins_listing_fuzzy), // list plugins/
+            MockResponse::Json(root_listing),      // list root
+            MockResponse::Json(plugins_deep),      // deep: list plugins/
+        ]);
+        // "xaby".contains("ab") is true but "ab".len() == 2 <= 3, so no match
+        let err = resolve_skill_path(&mock, "o", "r", Some("xaby")).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn resolve_skill_path_deep_search_no_match_in_skills() {
+        // Deep search finds plugins/vendor/skills/ with dirs, but none match — covers
+        // the false branches of all 3 conditions on lines 269-271
+        let plugins_listing = serde_json::json!([
+            {"name": "vendor", "path": "plugins/vendor", "type": "dir", "download_url": null}
+        ]);
+        let skills_listing = serde_json::json!([
+            {"name": "unrelated", "path": "plugins/vendor/skills/unrelated", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),
+            MockResponse::Exists(false),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Json(plugins_listing),
+            MockResponse::Json(skills_listing),
+        ]);
+        let err = resolve_skill_path(&mock, "o", "r", Some("zzz")).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn resolve_skill_path_deep_search_skills_listing_fails() {
+        // Deep search: list_github_dir for plugins/vendor/skills returns error — covers
+        // the Err branch of line 263
+        let plugins_listing = serde_json::json!([
+            {"name": "vendor", "path": "plugins/vendor", "type": "dir", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![
+            MockResponse::Exists(false),
+            MockResponse::Exists(false),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Err("404".into()),
+            MockResponse::Json(plugins_listing),    // deep: list plugins/ succeeds
+            MockResponse::Err("404".into()),        // deep: list plugins/vendor/skills fails
+        ]);
+        let err = resolve_skill_path(&mock, "o", "r", Some("ghost")).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn download_dir_skips_unknown_content_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listing = serde_json::json!([
+            {"name": "link", "path": "s/link", "type": "symlink", "download_url": null}
+        ]);
+        let mock = MockHttpClient::new(vec![MockResponse::Json(listing)]);
+        download_dir(&mock, "o", "r", "s", tmp.path()).unwrap();
+        // symlink type is neither "dir" nor "file", so nothing created
+        assert!(!tmp.path().join("link").exists());
+    }
+
     // ── SearchResult::source_with_skill ───────────────────────────
 
     #[test]
