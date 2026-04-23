@@ -18,6 +18,7 @@ pub struct Config {
     pub skills: Vec<Skill>,
     pub work_dir: String,
     pub stream: bool,
+    pub allow_bash: bool,
 }
 
 /// Execute the agentic loop to completion.
@@ -31,7 +32,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         &cfg.model
     };
 
-    let system_prompt = build_system_prompt(&cfg.skills);
+    let system_prompt = build_system_prompt(&cfg.skills, cfg.allow_bash);
     let work_dir = Path::new(&cfg.work_dir);
 
     let mut messages = vec![json!({
@@ -39,7 +40,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         "content": [{ "type": "text", "text": cfg.prompt }]
     })];
 
-    let mut tool_defs: Vec<Value> = tools::tool_defs();
+    let mut tool_defs: Vec<Value> = tools::tool_defs(cfg.allow_bash);
     tool_defs.push(json!({
         "name": "activate_skill",
         "description": "Load a skill's full instructions and resources. Use this when you determine a skill from the catalog is relevant to the task.",
@@ -92,7 +93,7 @@ pub fn run(cfg: &Config) -> Result<()> {
                 let (result, is_error) = if tool_name == "activate_skill" {
                     handle_activate_skill(input, &cfg.skills)
                 } else {
-                    match tools::dispatch(tool_name, input, work_dir) {
+                    match tools::dispatch(tool_name, input, work_dir, cfg.allow_bash) {
                         Ok(r) => (r, false),
                         Err(e) => (format!("Error: {e}"), true),
                     }
@@ -292,11 +293,21 @@ fn handle_activate_skill(input: &Value, skills: &[Skill]) -> (String, bool) {
     }
 }
 
-fn build_system_prompt(skills: &[Skill]) -> String {
+fn build_system_prompt(skills: &[Skill], allow_bash: bool) -> String {
     let mut prompt = String::from(
         "You are an AI assistant executing a task using Agent Skills. \
-         You have access to bash, read_file, and write_file tools to work in an isolated workspace directory.\n\n",
+         You have access to read_file and write_file tools to work in an isolated workspace directory.",
     );
+
+    if allow_bash {
+        prompt.push_str(" You also have access to a bash tool for executing shell commands.\n\n");
+    } else {
+        prompt.push_str(
+            " The bash tool is not available for this task. \
+             You must accomplish the task using only read_file and write_file. \
+             Do not attempt to call the bash tool.\n\n",
+        );
+    }
 
     if !skills.is_empty() {
         let catalog = skill::build_catalog(skills);

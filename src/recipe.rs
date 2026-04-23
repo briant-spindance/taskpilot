@@ -29,6 +29,7 @@ pub struct Recipe {
     pub skill_deps: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    pub allow_bash: Option<bool>,
 }
 
 /// Load and parse the taskpilot.toml file from the current directory.
@@ -133,6 +134,7 @@ in report.md with key metrics and insights
 input = ["staging/cleaned.csv"]
 output_dir = "output/"
 model = "claude-sonnet-4-20250514"
+allow_bash = true
 # skill_deps = ["markdown-report"]
 depends_on = ["prepare-data"]
 "#;
@@ -288,6 +290,13 @@ pub fn doctor() -> Result<()> {
                     errors += 1;
                 }
             }
+        }
+
+        // Show allow_bash status
+        if recipe.allow_bash.unwrap_or(false) {
+            println!("    {} bash: enabled", "!".yellow());
+        } else {
+            println!("    {} bash: disabled", "✓".green());
         }
 
         println!();

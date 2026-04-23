@@ -4,10 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Return the Anthropic tool definitions for the three built-in tools.
-pub fn tool_defs() -> Vec<Value> {
-    serde_json::json!([
-        {
+/// Return the Anthropic tool definitions, optionally including bash.
+pub fn tool_defs(allow_bash: bool) -> Vec<Value> {
+    let mut tools: Vec<Value> = Vec::new();
+
+    if allow_bash {
+        tools.push(serde_json::json!({
             "name": "bash",
             "description": "Execute a bash command in the working directory. Returns stdout, stderr, and exit code.",
             "input_schema": {
@@ -17,40 +19,46 @@ pub fn tool_defs() -> Vec<Value> {
                 },
                 "required": ["command"]
             }
-        },
-        {
-            "name": "read_file",
-            "description": "Read the contents of a file in the working directory.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path to the file to read" }
-                },
-                "required": ["path"]
-            }
-        },
-        {
-            "name": "write_file",
-            "description": "Write content to a file in the working directory.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path to the file to write" },
-                    "content": { "type": "string", "description": "The content to write" }
-                },
-                "required": ["path", "content"]
-            }
+        }));
+    }
+
+    tools.push(serde_json::json!({
+        "name": "read_file",
+        "description": "Read the contents of a file in the working directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative path to the file to read" }
+            },
+            "required": ["path"]
         }
-    ])
-    .as_array()
-    .unwrap()
-    .clone()
+    }));
+
+    tools.push(serde_json::json!({
+        "name": "write_file",
+        "description": "Write content to a file in the working directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative path to the file to write" },
+                "content": { "type": "string", "description": "The content to write" }
+            },
+            "required": ["path", "content"]
+        }
+    }));
+
+    tools
 }
 
 /// Dispatch a tool call and return the text result.
-pub fn dispatch(tool_name: &str, input: &Value, work_dir: &Path) -> Result<String> {
+pub fn dispatch(tool_name: &str, input: &Value, work_dir: &Path, allow_bash: bool) -> Result<String> {
     match tool_name {
-        "bash" => exec_bash(input, work_dir),
+        "bash" => {
+            if !allow_bash {
+                bail!("bash tool is disabled. Run with --allow-bash to enable shell commands.")
+            }
+            exec_bash(input, work_dir)
+        }
         "read_file" => exec_read_file(input, work_dir),
         "write_file" => exec_write_file(input, work_dir),
         _ => bail!("unknown tool: {tool_name}"),

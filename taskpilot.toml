@@ -6,6 +6,7 @@ and write the result to cleaned_data.csv
 """
 input = ["test/input/sales_data.csv"]
 output_dir = "test/staging"
+allow_bash = true
 
 [recipes.sales-report]
 prompt_file = "test/prompt.md"
@@ -13,6 +14,7 @@ input = ["test/staging/cleaned_data.csv"]
 output_dir = "test/output"
 skill_deps = ["markdown-report"]
 depends_on = ["clean-data"]
+allow_bash = true
 
 [recipes.executive-summary]
 prompt = """

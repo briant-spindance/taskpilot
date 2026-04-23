@@ -16,6 +16,8 @@ pub struct Config {
     pub model: Option<String>,
     /// Default streaming behavior (overridden by --no-stream flag)
     pub stream: Option<bool>,
+    /// Whether bash tool is allowed by default (overridden by --allow-bash flag or recipe field)
+    pub allow_bash: Option<bool>,
 }
 
 /// Resolve the config file path: ~/.local/taskpilot/config.yml
@@ -126,6 +128,13 @@ pub fn setup() -> Result<()> {
     io::stdin().lock().read_line(&mut stream_input)?;
     let stream = !stream_input.trim().eq_ignore_ascii_case("n");
 
+    // Bash
+    print!("  Allow bash tool by default? [y/N] ");
+    io::stdout().flush()?;
+    let mut bash_input = String::new();
+    io::stdin().lock().read_line(&mut bash_input)?;
+    let allow_bash = bash_input.trim().eq_ignore_ascii_case("y");
+
     // Write config
     let mut yaml = String::new();
     if let Some(ref key) = api_key {
@@ -135,6 +144,7 @@ pub fn setup() -> Result<()> {
     }
     yaml.push_str(&format!("model: {model}\n"));
     yaml.push_str(&format!("stream: {stream}\n"));
+    yaml.push_str(&format!("allow_bash: {allow_bash}\n"));
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

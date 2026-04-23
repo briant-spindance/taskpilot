@@ -58,6 +58,10 @@ enum Commands {
         /// Additional skills directory to search (repeatable)
         #[arg(long = "skills-dir")]
         skills_dir: Vec<String>,
+
+        /// Allow the bash tool (shell command execution is disabled by default)
+        #[arg(long)]
+        allow_bash: bool,
     },
 
     /// List recipes defined in taskpilot.toml
@@ -137,9 +141,10 @@ fn main() -> Result<()> {
             dry_run,
             no_stream,
             skills_dir,
+            allow_bash: cli_allow_bash,
         } => {
             // If a recipe name is given, load it and merge with CLI flags
-            let (task_prompt, final_input, final_output_dir, final_model) =
+            let (task_prompt, final_input, final_output_dir, final_model, recipe_allow_bash) =
                 if let Some(ref name) = recipe_name {
                     // Resolve depends_on chain first
                     let execution_order = recipe::resolve_depends_on(name)?;
@@ -186,7 +191,7 @@ fn main() -> Result<()> {
                     let out = output_dir.or(r.output_dir.clone());
                     let mdl = model.or(r.model.clone());
 
-                    (p, inp, out, mdl)
+                    (p, inp, out, mdl, r.allow_bash)
                 } else {
                     // No recipe — pure flag-based run
                     let p = if let Some(pf) = prompt_file {
@@ -198,7 +203,7 @@ fn main() -> Result<()> {
                         anyhow::bail!("--prompt or --prompt-file is required (or use a recipe name)");
                     };
 
-                    (p, input, output_dir, model)
+                    (p, input, output_dir, model, None)
                 };
 
             let resolved_model = final_model
@@ -209,6 +214,15 @@ fn main() -> Result<()> {
                 false
             } else {
                 global_config.stream.unwrap_or(true)
+            };
+
+            // Resolve allow_bash: CLI flag > recipe field > config.yml > default (false)
+            let allow_bash = if cli_allow_bash {
+                true
+            } else {
+                recipe_allow_bash
+                    .or(global_config.allow_bash)
+                    .unwrap_or(false)
             };
 
             // Discover skills
@@ -227,6 +241,7 @@ fn main() -> Result<()> {
                 }
                 println!("Inputs: {final_input:?}");
                 println!("Output dir: {}", final_output_dir.as_deref().unwrap_or("(none)"));
+                println!("Bash: {}", if allow_bash { "enabled" } else { "disabled" });
                 return Ok(());
             }
 
@@ -245,6 +260,7 @@ fn main() -> Result<()> {
                 skills,
                 work_dir: ws.dir.to_string_lossy().to_string(),
                 stream: use_stream,
+                allow_bash,
             })?;
 
             // Collect outputs
@@ -365,6 +381,10 @@ fn run_recipe(
         global_config.stream.unwrap_or(true)
     };
 
+    let allow_bash = r.allow_bash
+        .or(global_config.allow_bash)
+        .unwrap_or(false);
+
     let skills = skill::discover(extra_skills_dirs).context("discover skills")?;
     let ws = workspace::Workspace::new()?;
     if !final_input.is_empty() {
@@ -377,6 +397,7 @@ fn run_recipe(
         skills,
         work_dir: ws.dir.to_string_lossy().to_string(),
         stream: use_stream,
+        allow_bash,
     })?;
 
     if let Some(ref out) = final_output_dir {

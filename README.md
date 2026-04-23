@@ -2,11 +2,9 @@
 
 *Sometimes you don't need to talk to your agent — you just need it to do the work.*
 
-Taskpilot is a CLI tool that executes [Agent Skills](https://agentskills.io) as standalone, headless agentic tasks. 
+A CLI tool that executes [Agent Skills](https://agentskills.io) as standalone, headless agentic tasks. Think of it as a Makefile for AI work — give it a prompt and input files, and it drives a full tool-use loop against the Anthropic API until the task is complete.
 
-Think of it as Makefile for your AI tasks. Give it a prompt and input files, and it drives a full tool-use loop against the Anthropic API until the task is complete.
-
-taskpilot is a skill *client*, not a skill *host*. It discovers installed skills, assembles context for the model, manages the agentic loop, and stages files in and out of an isolated workspace. 
+taskpilot is a skill *client*, not a skill *host*. It discovers installed skills, assembles context for the model, manages the agentic loop, and stages files in and out of an isolated workspace.
 
 ## Install
 
@@ -28,10 +26,10 @@ git clone <repo-url> && cd skillsrunner
 # First-time setup (creates ~/.local/taskpilot/config.yml)
 taskpilot config
 
-# Run an ad-hoc task
-taskpilot run --prompt "Summarize this data" --input data.csv --output-dir out/
+# Run an ad-hoc task (--allow-bash enables shell commands)
+taskpilot run --prompt "Summarize this data" --input data.csv --output-dir out/ --allow-bash
 
-# Run a named recipe
+# Run a named recipe (bash permission is set per-recipe in taskpilot.toml)
 taskpilot run sales-report
 
 # Dry run (show resolved config without executing)
@@ -71,6 +69,7 @@ and write cleaned.csv
 """
 input = ["data/input.csv"]
 output_dir = "staging/"
+allow_bash = true
 
 [recipes.generate-report]
 prompt = """
@@ -80,6 +79,7 @@ in report.md with key metrics and insights
 input = ["staging/cleaned.csv"]
 output_dir = "output/"
 model = "claude-sonnet-4-20250514"
+allow_bash = true
 skill_deps = ["markdown-report"]
 depends_on = ["clean-data"]
 
@@ -127,6 +127,7 @@ You can also run any recipe in the chain directly. Running `taskpilot run genera
 | `model` | Anthropic model to use for this recipe. |
 | `skill_deps` | Skills that must be installed before the recipe runs. Bare names (e.g. `"pdf"`) are checked locally; remote sources (e.g. `"anthropics/skills/pdf"`) prompt for install if missing. |
 | `depends_on` | Array of recipe names that must run before this one. |
+| `allow_bash` | Enable the bash tool for this recipe (`true`/`false`). Default: `false`. |
 
 All fields are optional. At minimum, a recipe needs either `prompt` or `prompt_file`.
 
@@ -253,11 +254,72 @@ Path:        /Users/you/.agents/skills/pdf
 
 ### Skill activation
 
-Skills are activated by the model, not by the user. taskpilot injects a catalog of all discovered skills into the system prompt. The model reads the catalog, determines which skills are relevant to the current task, and activates them via the `activate_skill` tool — loading the full `SKILL.md` instructions and bundled resources. Multiple skills can be activated in a single session.
+You don't choose which skills to use — the model does. When taskpilot starts a task, it injects a catalog of all discovered skills (name and description) into the system prompt. The model reads your prompt, decides which skills are relevant, and activates them on its own by calling the `activate_skill` tool. This loads the full `SKILL.md` instructions and any bundled scripts, references, or assets into the conversation.
+
+This means you can install a broad set of skills and let the model pick the right ones for each task. A prompt like *"create a PDF report from this data"* will cause the model to activate a PDF skill if one is installed, without you having to specify it. Multiple skills can be activated in a single session if the task calls for it.
+
+If a task *requires* a specific skill and shouldn't run without it, use `skill_deps` in your recipe. This guarantees the skill is installed before the prompt ever reaches the model — taskpilot will error or prompt you to install it rather than letting the model attempt the task without the right instructions.
 
 ## Streaming
 
 Output streams in real-time by default. Text appears as the model generates it. Use `--no-stream` to wait for complete responses (useful in CI/pipelines).
+
+## Agent Tools
+
+During a task, the model has access to these tools:
+
+| Tool | Default | Description |
+|------|---------|-------------|
+| `read_file` | enabled | Read the contents of a file. Path must be relative to the workspace — attempts to read outside the sandbox are rejected. |
+| `write_file` | enabled | Write content to a file. Creates parent directories automatically. Same sandboxing rules as `read_file`. |
+| `activate_skill` | enabled | Load a skill by name from the discovered catalog. Returns the full `SKILL.md` instructions and a listing of bundled resources (scripts, references, assets). The model calls this when it determines a skill is relevant to the task. |
+| `bash` | **disabled** | Execute any shell command in the workspace directory. Returns stdout, stderr, and exit code. Must be explicitly enabled (see Security below). |
+
+All file operations (`read_file`, `write_file`) are sandboxed to the workspace directory. The agent cannot read or write files outside it.
+
+## Security
+
+### Bash is disabled by default
+
+The `bash` tool gives the agent the ability to run arbitrary shell commands with your user's full permissions. This includes installing packages, accessing the network, reading files outside the workspace, and executing arbitrary code. Because of this, **bash is disabled by default**.
+
+When bash is disabled, the model is told it's unavailable and the tool definition is not sent to the API. If the model somehow attempts a bash call anyway, it's rejected with an error.
+
+### Enabling bash
+
+Most real-world tasks need bash — running Python scripts, processing data, installing dependencies. Enable it explicitly when you trust the prompt, skills, and input files:
+
+```bash
+# Per-run via CLI flag
+taskpilot run my-task --allow-bash
+
+# Per-recipe in taskpilot.toml
+[recipes.generate-report]
+prompt = "Analyze the data and produce a report"
+allow_bash = true
+
+# Globally in ~/.local/taskpilot/config.yml
+allow_bash: true
+```
+
+Precedence: `--allow-bash` flag > recipe `allow_bash` field > config.yml `allow_bash` > default (false).
+
+### What's sandboxed, what's not
+
+| Tool | Sandboxed? | Notes |
+|------|-----------|-------|
+| `read_file` | Yes | Paths are resolved and checked — `../` escapes are rejected |
+| `write_file` | Yes | Same path restrictions as `read_file` |
+| `bash` | **No** | Full shell access when enabled. Commands run with workspace as cwd, but can reach the entire system. |
+| `activate_skill` | N/A | Reads skill files from known directories only |
+
+### Recommendations
+
+- **Leave bash disabled** for tasks that only need to read and write files (summarization, formatting, simple transformations)
+- **Enable bash per-recipe** rather than globally — this makes it explicit which tasks have shell access
+- **Be cautious with untrusted inputs** — a malicious file (e.g. a CSV with crafted content) could influence the model to run harmful commands when bash is enabled
+- **Review skills before installing** — skills are arbitrary instructions that tell the model what to do. A malicious skill could instruct the model to exfiltrate data or run destructive commands
+- **Use `--dry-run`** to inspect the resolved configuration (including bash status) before executing
 
 ## Commands
 
@@ -296,13 +358,16 @@ model: claude-sonnet-4-20250514
 
 # Default streaming behavior (overridden by --no-stream flag)
 stream: true
+
+# Allow bash tool by default (overridden by --allow-bash flag or recipe field)
+allow_bash: false
 ```
 
 ### Reference
 
 | Source | Purpose |
 |--------|---------|
-| `~/.local/taskpilot/config.yml` | Global defaults (API key, model, streaming) |
+| `~/.local/taskpilot/config.yml` | Global defaults (API key, model, streaming, bash) |
 | `.env` | Project-level environment variables |
 | `ANTHROPIC_API_KEY` | API authentication (env var, `.env`, or config) |
 | `TASKPILOT_SKILLS_DIR` | Override user-level skills directory |
@@ -315,7 +380,7 @@ stream: true
 3. Checks `skill_deps` are installed (prompts to install remote deps if missing)
 4. Creates an isolated temp workspace and stages input files
 5. Builds a system prompt with the skill catalog
-6. Drives a tool-use loop (bash, read_file, write_file) against the Anthropic API
+6. Drives a tool-use loop (`read_file`, `write_file`, and `bash` if enabled) against the Anthropic API
 7. Collects output files from the workspace to `output_dir`
 
 The agent operates in a sandboxed temp directory. Your filesystem is not modified outside the specified output directory.
