@@ -275,7 +275,7 @@ During a task, the model has access to these tools:
 | `activate_skill` | enabled | Load a skill by name from the discovered catalog. Returns the full `SKILL.md` instructions and a listing of bundled resources (scripts, references, assets). The model calls this when it determines a skill is relevant to the task. |
 | `bash` | **disabled** | Execute any shell command in the workspace directory. Returns stdout, stderr, and exit code. Must be explicitly enabled (see Security below). |
 
-All file operations (`read_file`, `write_file`) are sandboxed to the workspace directory. The agent cannot read or write files outside it.
+All file operations (`read_file`, `write_file`) are sandboxed to the workspace directory and cannot access files outside it. However, if the `bash` tool is enabled, the agent can bypass this sandbox entirely — see [Security](#security) below.
 
 ## Security
 
